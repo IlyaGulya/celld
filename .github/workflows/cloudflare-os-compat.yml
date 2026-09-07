@@ -23,6 +23,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Apply Cloudflare OS compatibility patch
+        run: python3 scripts/agentos_cloudflare_compat_patch.py
+
+      - name: Verify patch is source-only
+        run: git diff --check
+
       - name: Install Rust
         run: |
           set -euo pipefail
