@@ -69,8 +69,8 @@ new_loader = '''  // Turn durable loopback ServiceStubs into data that a fresh i
 '''
 replace_once(harness, old_loader, new_loader)
 
-# Install a recursive reviver because props may themselves contain plain data
-# structures. Nested capabilities are deliberately left for the generic bridge.
+# Install a recursive reviver because env may contain ordinary nested data.
+# Nested capabilities are deliberately left for the generic handle bridge.
 anchor = '''globalThis.__makeServiceBinding = (script, entrypoint = null) => {\n'''
 reviver = '''globalThis.__reviveLoaderEnv = (env) => {
   const seen = new Map();
@@ -96,22 +96,14 @@ globalThis.__makeServiceBinding = (script, entrypoint = null) => {
 '''
 replace_once(harness, anchor, reviver)
 
+# Keep this replacement deliberately tiny: upstream formats the Rust string
+# with an escaped physical newline, which is easy to mismatch in a multiline
+# Python literal. The JS fragment itself is unique in bootstrap.rs.
 bootstrap = ROOT / "crates/celld/js/bootstrap.rs"
-old_bootstrap = '''        // A loaded worker's caller-supplied `env` (plain JSON values only in
-        // the walking skeleton) merges last, over the declared bindings.
-        if let Some(env) = config.loader_env.as_deref() {
-            lines.push_str(&format!("Object.assign(e, {});\\
-", env));
-        }
-'''
-new_bootstrap = '''        // A loaded worker's caller-supplied env merges last, over declared
-        // bindings. The harness revives portable capability descriptors before
-        // exposing them to user code.
-        if let Some(env) = config.loader_env.as_deref() {
-            lines.push_str(&format!("Object.assign(e, __reviveLoaderEnv({}));\\
-", env));
-        }
-'''
-replace_once(bootstrap, old_bootstrap, new_bootstrap)
+replace_once(
+    bootstrap,
+    'Object.assign(e, {});',
+    'Object.assign(e, __reviveLoaderEnv({}));',
+)
 
 print("Applied AgentOS Cloudflare OS compatibility patch: service env bridge")
