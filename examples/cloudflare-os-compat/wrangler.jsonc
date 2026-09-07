@@ -1,0 +1,17 @@
+{
+  "name": "cloudflare-os-compat",
+  "main": "index.js",
+  "compatibility_date": "2026-09-07",
+  "compatibility_flags": ["allow_irrevocable_stub_storage"],
+  "durable_objects": {
+    "bindings": [
+      { "name": "FACET_HOST", "class_name": "FacetHost" }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["FacetHost", "FacetTool"]
+    }
+  ]
+}
