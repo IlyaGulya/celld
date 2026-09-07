@@ -1,4 +1,4 @@
-import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
+import { DurableObject, RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
 
 // This example is intentionally modeled after the primitives Cloudflare OS
 // relies on for Code Mode and Gatekeepers. Keep it small: if this works, we
@@ -7,6 +7,12 @@ import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 export class EchoTool extends WorkerEntrypoint {
   async echo(value) {
     return `${this.ctx.props.prefix}:${value}`;
+  }
+}
+
+class TransientTool extends RpcTarget {
+  echo(value) {
+    return `transient:${value}`;
   }
 }
 
@@ -52,6 +58,16 @@ export default {
 };
 `;
 
+const TRANSIENT_DYNAMIC_WORKER = `
+import { WorkerEntrypoint } from "cloudflare:workers";
+
+export default class extends WorkerEntrypoint {
+  async run(tool, value) {
+    return tool.echo(value);
+  }
+}
+`;
+
 function load(env, code, extraEnv = {}) {
   return env.LOADER.load({
     compatibilityDate: "2026-09-07",
@@ -73,12 +89,22 @@ export default {
     if (url.pathname === "/capability") {
       // This is the canonical Dynamic Workers custom-binding pattern:
       // create a props-scoped loopback WorkerEntrypoint stub and pass it into
-      // the dynamic Worker's env. Cloudflare OS uses the same capability idea
-      // for Code Mode access to Gatekeepers/Gadgets.
+      // the dynamic Worker's env. Cloudflare OS uses this for binding loopbacks.
       const tool = ctx.exports.EchoTool({ props: { prefix: "capability" } });
       return load(env, CAPABILITY_DYNAMIC_WORKER, { TOOL: tool })
         .getEntrypoint()
         .fetch(request);
+    }
+
+    if (url.pathname === "/transient") {
+      // Cloudflare OS also passes transient RpcTargets as arguments to the
+      // loaded Code Mode entrypoint (e.g. RestoreForgerImpl). Those cannot be
+      // reduced to a durable service descriptor and therefore exercise the
+      // actual cross-isolate RPC-handle path.
+      const result = await load(env, TRANSIENT_DYNAMIC_WORKER)
+        .getEntrypoint()
+        .run(new TransientTool(), "hello");
+      return Response.json({ result });
     }
 
     if (url.pathname === "/facet") {
@@ -87,7 +113,7 @@ export default {
     }
 
     return Response.json({
-      endpoints: ["/plain", "/capability", "/facet"],
+      endpoints: ["/plain", "/capability", "/transient", "/facet"],
     });
   },
 };
