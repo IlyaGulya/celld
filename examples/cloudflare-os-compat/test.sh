@@ -58,9 +58,9 @@ run_case() {
   rm -f "$body_file"
 
   if [[ "$status" == "200" && "$body" == *"$expected"* ]]; then
-    printf 'PASS %-24s HTTP %s %s\n' "$name" "$status" "$body"
+    printf 'PASS %-28s HTTP %s %s\n' "$name" "$status" "$body"
   else
-    printf 'FAIL %-24s HTTP %s %s\n' "$name" "$status" "$body" >&2
+    printf 'FAIL %-28s HTTP %s %s\n' "$name" "$status" "$body" >&2
     failures=$((failures + 1))
   fi
 }
@@ -69,9 +69,14 @@ run_case() {
 # tell us anything useful.
 run_case "plain dynamic worker" "/plain" 'plain-dynamic-worker'
 
-# Cloudflare Dynamic Workers custom binding pattern, and the core primitive
-# tracked by denoland/celld#174.
-run_case "cross-isolate capability" "/capability?value=hello" 'capability:hello'
+# Cloudflare Dynamic Workers custom binding pattern. Cloudflare OS uses
+# props-bearing ServiceStubs for its Gadget/Gatekeeper binding loopbacks.
+run_case "service capability in env" "/capability?value=hello" 'capability:hello'
+
+# Cloudflare OS executeCode() passes a transient RpcTarget (RestoreForgerImpl)
+# as an argument to the loaded Code Mode Worker, so this must cross the isolate
+# even though it has no durable service identity.
+run_case "transient RPC argument" "/transient" 'transient:hello'
 
 # Cloudflare OS Gatekeepers instantiate props-bearing DurableObjectClass values
 # from ctx.exports and hand them to ctx.facets.get().
