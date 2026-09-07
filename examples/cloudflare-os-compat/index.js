@@ -4,6 +4,12 @@ import { DurableObject, RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
 // relies on for Code Mode and Gatekeepers. Keep it small: if this works, we
 // know celld has the runtime semantics we need without booting Cloudflare OS.
 
+export class EchoNoProps extends WorkerEntrypoint {
+  echo(value) {
+    return `service:${value}`;
+  }
+}
+
 export class EchoTool extends WorkerEntrypoint {
   async echo(value) {
     return `${this.ctx.props.prefix}:${value}`;
@@ -86,6 +92,13 @@ export default {
       return load(env, PLAIN_DYNAMIC_WORKER).getEntrypoint().fetch(request);
     }
 
+    if (url.pathname === "/service") {
+      const tool = ctx.exports.EchoNoProps;
+      return load(env, CAPABILITY_DYNAMIC_WORKER, { TOOL: tool })
+        .getEntrypoint()
+        .fetch(request);
+    }
+
     if (url.pathname === "/capability") {
       // This is the canonical Dynamic Workers custom-binding pattern:
       // create a props-scoped loopback WorkerEntrypoint stub and pass it into
@@ -113,7 +126,7 @@ export default {
     }
 
     return Response.json({
-      endpoints: ["/plain", "/capability", "/transient", "/facet"],
+      endpoints: ["/plain", "/service", "/capability", "/transient", "/facet"],
     });
   },
 };
