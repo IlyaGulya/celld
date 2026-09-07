@@ -65,17 +65,16 @@ run_case() {
   fi
 }
 
-# Control: Dynamic Workers themselves must work before the more advanced tests
-# tell us anything useful.
 run_case "plain dynamic worker" "/plain" 'plain-dynamic-worker'
 
-# Cloudflare Dynamic Workers custom binding pattern. Cloudflare OS uses
-# props-bearing ServiceStubs for its Gadget/Gatekeeper binding loopbacks.
-run_case "service capability in env" "/capability?value=hello" 'capability:hello'
+# First isolate the transport problem from ctx.props semantics.
+run_case "service env transport" "/service?value=hello" 'service:hello'
+
+# Cloudflare OS uses props-bearing ServiceStubs for Gadget/Gatekeeper loopbacks.
+run_case "service env with props" "/capability?value=hello" 'capability:hello'
 
 # Cloudflare OS executeCode() passes a transient RpcTarget (RestoreForgerImpl)
-# as an argument to the loaded Code Mode Worker, so this must cross the isolate
-# even though it has no durable service identity.
+# as an argument to the loaded Code Mode Worker.
 run_case "transient RPC argument" "/transient" 'transient:hello'
 
 # Cloudflare OS Gatekeepers instantiate props-bearing DurableObjectClass values
