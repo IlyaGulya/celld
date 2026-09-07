@@ -1,0 +1,39 @@
+name: Cloudflare OS compatibility
+
+on:
+  push:
+    branches:
+      - agentos/cloudflare-os-compat
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloudflare-os-compat-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_VERSION: 1.97.1
+
+jobs:
+  compat:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+
+      - name: Build celld
+        run: cargo build --locked
+
+      - name: Install esbuild
+        run: npm install --global esbuild
+
+      - name: Run Cloudflare OS compatibility sentinel
+        run: bash examples/cloudflare-os-compat/test.sh "$PWD/target/debug/celld"
