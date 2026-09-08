@@ -208,7 +208,118 @@ replace_once(
     'Object.assign(e, __reviveLoaderEnv({}));',
 )
 
+# Same-script Durable Object classes from ctx.exports. Reuse the existing
+# loader-backed facet runtime by registering the current WorkerConfig once per
+# isolate, rather than creating a second storage/fencing implementation.
+js_rs = ROOT / "crates/celld/js.rs"
+replace_once(
+    js_rs,
+    '''#[derive(Clone, Copy, Eq, PartialEq)]\nstruct LoaderOwner(u64);\n\nimpl LoaderOwner {''',
+    '''#[derive(Clone, Copy, Eq, PartialEq)]\nstruct LoaderOwner(u64);\n\n#[derive(Clone, Copy)]\nstruct SelfLoaderId(u64);\n\nimpl LoaderOwner {''',
+)
+replace_once(
+    js_rs,
+    '''        "__loader_load" => op_loader_load,\n        "__loader_fetch" => op_loader_fetch,''',
+    '''        "__loader_self" => op_loader_self,\n        "__loader_load" => op_loader_load,\n        "__loader_fetch" => op_loader_fetch,''',
+)
+loader_self_anchor = '''/// `__loader_load(codeJson)` -> stub id. Builds a WorkerConfig from the\n'''
+loader_self_impl = '''/// `__loader_self()` -> stub id. Registers this deployment's own WorkerConfig
+/// as a loader-backed runtime once per isolate. This lets ctx.exports expose
+/// same-script DurableObjectClass values while reusing the existing facet
+/// storage/fencing path instead of creating a second facet runtime.
+fn op_loader_self(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    if let Some(id) = scope.get_slot::<SelfLoaderId>() {
+        rv.set(v8::Number::new(scope, id.0 as f64).into());
+        return;
+    }
+
+    let owner = *scope
+        .get_slot::<LoaderOwner>()
+        .expect("Worker isolate has a Loader owner");
+    let config = scope
+        .get_slot::<Arc<BundleFs>>()
+        .expect("Worker isolate has a bundle config")
+        .config
+        .clone();
+    let max = crate::env_vars::positive_or("CELLD_MAX_LOADED_WORKERS", 256)
+        .expect("validated CELLD_MAX_LOADED_WORKERS");
+    if loader_registry().lock().unwrap().len() >= max {
+        return loader_throw(
+            scope,
+            &format!("worker loader: too many loaded workers (limit {max})"),
+        );
+    }
+
+    let id = LOADER_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let handle = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle,
+        Err(error) => return loader_throw(scope, &format!("worker loader: {error}")),
+    };
+    let (loaded, state) = tokio::sync::watch::channel(LoaderState::Loading);
+    loader_registry()
+        .lock()
+        .unwrap()
+        .insert(id, LoaderEntry { owner, state });
+    scope.set_slot(SelfLoaderId(id));
+    handle.spawn(async move {
+        let state = match tokio::task::spawn_blocking(move || Worker::load_config(config)).await {
+            Ok(Ok(worker)) => LoaderState::Ready(crate::pool::Slot::standalone(worker)),
+            Ok(Err(error)) => LoaderState::Failed(Arc::from(format!("{error}"))),
+            Err(error) => LoaderState::Failed(Arc::from(format!(
+                "worker loader: load task failed: {error}"
+            ))),
+        };
+        loaded.send_replace(state);
+    });
+    rv.set(v8::Number::new(scope, id as f64).into());
+}
+
+'''
+replace_once(js_rs, loader_self_anchor, loader_self_impl + loader_self_anchor)
+
+old_ctx_exports = '''// ctx.exports: loopback stubs for every exported entrypoint plus
+// this worker's Durable Object namespaces. Built once, on first
+// access — ctx construction itself only carries the getter.
+let __ctxExportsCache;
+const __ctxExports = () => __ctxExportsCache ??= (() => {
+  const out = {};
+  for (const name of Object.keys(__cell.entrypoints))
+    out[name] = __entrypointStub(name, undefined);
+  for (const name of Object.keys(__cell.objectEntrypoints))
+    if (name !== "default")
+      out[name] = __entrypointStub(name, undefined);
+  for (const name of Object.keys(__cell.namespaceKeys))
+    out[name] = __cell.makeNamespace(name);
+  return out;
+})();'''
+new_ctx_exports = '''// ctx.exports: loopback stubs for exported WorkerEntrypoints and callable
+// DurableObjectClass factories for this worker's own DO classes. Workerd's
+// ctx.exports.SomeDurableObject({ props }) returns a class descriptor suitable
+// for ctx.facets.get(); env bindings remain DurableObjectNamespace objects.
+let __ctxExportsCache;
+let __selfLoaderId;
+const __selfDurableObjectClass = (name) => (options = {}) =>
+  __makeDurableObjectClass(
+    Promise.resolve(__selfLoaderId ??= __loader_self()), name, options);
+const __ctxExports = () => __ctxExportsCache ??= (() => {
+  const out = {};
+  for (const name of Object.keys(__cell.entrypoints))
+    out[name] = __entrypointStub(name, undefined);
+  for (const name of Object.keys(__cell.objectEntrypoints))
+    if (name !== "default")
+      out[name] = __entrypointStub(name, undefined);
+  for (const name of Object.keys(__cell.doExports))
+    if (!name.startsWith("__") && name !== ".cron")
+      out[name] = __selfDurableObjectClass(name);
+  return out;
+})();'''
+replace_once(harness, old_ctx_exports, new_ctx_exports)
+
 print(
     "Applied AgentOS Cloudflare OS compatibility patch: "
-    "service env bridge + cross-isolate entrypoint props"
+    "service env bridge + cross-isolate entrypoint props + ctx.exports facets"
 )
