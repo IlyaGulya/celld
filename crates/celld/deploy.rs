@@ -17,8 +17,8 @@ use crate::protocol::{
     asset_blob_key, AssetConfig, AssetEntry, AssetIndex, AssetManifestRef, DeployPointer, Manifest,
     ModuleKind, ModuleRef, QueueConsumerAttachment, QueueConsumerConfig, QueueConsumerDeployment,
     Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_CRON_V1, FEATURE_D1_V1, FEATURE_KV_V1,
-    FEATURE_QUEUES_V1, FEATURE_R2_V1, FEATURE_SQLITE_VEC_V1, FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1,
-    QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
+    FEATURE_QUEUES_V1, FEATURE_R2_V1, FEATURE_SQLITE_VEC_V1, FEATURE_WASM_V1,
+    FEATURE_WORKER_LOADER_V1, FEATURE_WORKFLOWS_V1, QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context};
 use flate2::write::GzEncoder;
@@ -52,6 +52,7 @@ const SUPPORTED_KEYS: &[&str] = &[
     "queues",
     "workflows",
     "r2_buckets",
+    "worker_loaders",
     "no_bundle",
 ];
 
@@ -281,6 +282,7 @@ struct Project {
     queue_consumers: Vec<QueueConsumerConfig>,
     has_queues: bool,
     has_r2: bool,
+    has_worker_loaders: bool,
 }
 
 struct ProjectAssets {
@@ -547,6 +549,9 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             }
             if project.has_r2 {
                 features.push(FEATURE_R2_V1.to_string());
+            }
+            if project.has_worker_loaders {
+                features.push(FEATURE_WORKER_LOADER_V1.to_string());
             }
             if sqlite_vec {
                 features.push(FEATURE_SQLITE_VEC_V1.to_string());
@@ -1056,7 +1061,10 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
     // Wrangler-shaped upload metadata, so a manifest written here and one
     // written by the control plane describe a deployment the same way.
     let mut bindings = Vec::new();
-    let mut do_classes = Vec::new();
+    // A SQLite migration declares the Durable Object class even when the Worker
+    // exposes it only through ctx.exports and has no env namespace binding.
+    // Cloudflare OS relies on this for AdminSettings and other internal classes.
+    let mut do_classes = sqlite_classes.clone();
     for binding in object
         .get("durable_objects")
         .and_then(|value| value.get("bindings"))
@@ -1072,7 +1080,9 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
             .get("class_name")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("durable object binding {name} has no `class_name`"))?;
-        do_classes.push(class_name.to_string());
+        if !do_classes.iter().any(|class| class == class_name) {
+            do_classes.push(class_name.to_string());
+        }
         bindings.push(json!({
             "type": "durable_object_namespace",
             "name": name,
@@ -1115,6 +1125,38 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
         }
         bindings.push(encoded);
         service_count += 1;
+    }
+    let worker_loaders = match object.get("worker_loaders") {
+        None => &[][..],
+        Some(Value::Array(loaders)) => loaders.as_slice(),
+        Some(_) => bail!("config `worker_loaders` must be an array"),
+    };
+    for loader in worker_loaders {
+        let loader = loader
+            .as_object()
+            .ok_or_else(|| anyhow!("worker loader binding must be an object"))?;
+        let unsupported = loader
+            .keys()
+            .filter(|key| key.as_str() != "binding")
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unsupported.is_empty() {
+            bail!(
+                "worker loader binding does not support keys: {}",
+                unsupported.join(", ")
+            );
+        }
+        let binding = loader
+            .get("binding")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("worker loader has no `binding`"))?;
+        if !valid_binding(binding) {
+            bail!("invalid worker loader binding name: {binding:?}");
+        }
+        bindings.push(json!({
+            "type": "worker_loader",
+            "name": binding,
+        }));
     }
     let d1_databases = match object.get("d1_databases") {
         None => &[][..],
@@ -1174,9 +1216,8 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
     let mut kv_ids = BTreeSet::new();
     for namespace in kv_namespaces {
         // Every key celld does not model stops the deploy, per the loud-gap
-        // rule. `preview_id` is the exception and is accepted below: it selects
-        // a different namespace under `wrangler dev`, which celld does not run,
-        // so ignoring it costs a developer nothing at deploy time.
+        // rule. `preview_id` is Wrangler's local-development namespace identity;
+        // celld dev uses it only when the production `id` is absent.
         let unsupported = namespace
             .as_object()
             .map(|object| {
@@ -1200,29 +1241,27 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
         if !valid_binding(binding) {
             bail!("invalid kv binding name: {binding:?}");
         }
-        // `id` is the namespace identity, verbatim, and celld invents no
-        // `namespace_name` key beside it. Upstream's `kv_namespaces` carries no
-        // human-readable name at all -- only `binding`, `id` and `preview_id` --
-        // and celld's accepted configuration is a strict subset of Wrangler's:
-        // a key celld accepts and Wrangler diagnoses would make the file
-        // unportable, which is the one property the deploy story rests on. A
-        // project ported from Cloudflare therefore keeps its hex id and works;
-        // a project that was never there writes a readable string.
-        let id = namespace.get("id").and_then(Value::as_str).ok_or_else(|| {
-            anyhow!(
-                "kv binding {binding} has no `id`; celld uses the id as the \
-                     namespace identity, so any stable string serves"
-            )
-        })?;
+        // Wrangler uses `id` for production and `preview_id` for local development.
+        // Prefer the production identity when both are present; otherwise accept
+        // the preview identity so an unchanged Wrangler dev config works in celld dev.
+        let id = namespace
+            .get("id")
+            .or_else(|| namespace.get("preview_id"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                anyhow!(
+                    "kv binding {binding} has neither `id` nor `preview_id`; celld uses one as the namespace identity"
+                )
+            })?;
         if id.is_empty() {
-            bail!("kv binding {binding} has an empty `id`");
+            bail!("kv binding {binding} has an empty `id`/`preview_id`");
         }
         // The id becomes a cell name and therefore a path component and an
         // object-store key, so it answers to the same charset fence every cell
         // scope does rather than to a looser one invented here.
         if !celld_logic::cell::valid_cell_scope(id) {
             bail!(
-                "kv binding {binding} has an `id` that cannot name a cell: {id:?}; \
+                "kv binding {binding} has an identity that cannot name a cell: {id:?}; \
                  use ASCII letters, digits, and `_ - . : $`"
             );
         }
@@ -1501,14 +1540,18 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
         if !valid_binding(name) {
             bail!("invalid var binding name: {name:?}");
         }
-        let value = value
-            .as_str()
-            .ok_or_else(|| anyhow!("var binding {name} must be a string"))?;
-        bindings.push(json!({
-            "type": "plain_text",
-            "name": name,
-            "text": value,
-        }));
+        match value {
+            Value::String(value) => bindings.push(json!({
+                "type": "plain_text",
+                "name": name,
+                "text": value,
+            })),
+            value => bindings.push(json!({
+                "type": "json",
+                "name": name,
+                "json": value,
+            })),
+        }
         var_count += 1;
     }
     if main.is_none()
@@ -1516,7 +1559,8 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
             || !sqlite_classes.is_empty()
             || service_count > 0
             || var_count > 0
-            || !r2_binding_names.is_empty())
+            || !r2_binding_names.is_empty()
+            || !worker_loaders.is_empty())
     {
         bail!("an asset-only project cannot declare Worker bindings");
     }
@@ -1584,6 +1628,7 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
         has_queues: !queue_producers.is_empty() || !queue_consumers.is_empty(),
         queue_consumers,
         has_r2: !r2_buckets.is_empty(),
+        has_worker_loaders: !worker_loaders.is_empty(),
     })
 }
 

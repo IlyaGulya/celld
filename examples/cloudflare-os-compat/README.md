@@ -6,17 +6,25 @@ It is intentionally smaller than Cloudflare OS itself. The goal is to make missi
 
 ## Cases
 
-### 1. Plain Dynamic Worker
+### 1. Plain Dynamic Worker from Wrangler config
 
-`/plain` loads a fresh Dynamic Worker and invokes its default entrypoint.
+`/plain` loads a fresh Dynamic Worker and invokes its default entrypoint. The Loader is declared through `worker_loaders` in `wrangler.jsonc`, not a process-wide environment override.
 
 This is the control case. If it fails, the Worker Loader itself is not usable for Cloudflare OS.
 
-### 2. Service binding transport
+### 2. JSON vars
+
+`/json-var` verifies that a non-string Wrangler `vars` value arrives in `env` as JSON rather than a stringified value. Cloudflare OS uses this for values such as the `ADMINS` array.
+
+### 3. KV `preview_id`
+
+`/kv-preview` writes and reads a KV binding declared with only `preview_id`, matching Wrangler local-development configs.
+
+### 4. Service binding transport
 
 `/service` passes a plain `ctx.exports` `ServiceStub` through a Dynamic Worker's `env` and calls it from the loaded isolate. This isolates basic cross-isolate service transport from per-instance props.
 
-### 3. Props-bearing service capability
+### 5. Props-bearing service capability
 
 `/capability` follows Cloudflare's documented custom-binding pattern:
 
@@ -26,17 +34,23 @@ This is the control case. If it fails, the Worker Loader itself is not usable fo
 
 Cloudflare OS uses this shape for scoped Gadget/Gatekeeper loopbacks.
 
-### 4. Transient `RpcTarget` argument
+### 6. Transient `RpcTarget` argument
 
 `/transient` passes a request-scoped `RpcTarget` as an argument to a loaded Worker entrypoint. The loaded isolate calls the capability back in the originating isolate through the process-local RPC bridge while preserving the originating request context.
 
 This is the primitive tracked by `denoland/celld#174` and required by Cloudflare OS Code Mode for capabilities such as `RestoreForgerImpl`; replacing it with a bearer-token HTTP endpoint would weaken the capability model.
 
-### 5. `ctx.exports` Durable Object facet class
+### 7. `ctx.exports` Durable Object facet class
 
 `/facet` creates a props-bearing `DurableObjectClass` using `ctx.exports.FacetTool({ props })` and passes it to `ctx.facets.get()`.
 
 Cloudflare OS uses this shape when instantiating Gatekeeper facets.
+
+### 8. `ctx.exports` Durable Object namespace surface
+
+`/ctx-exports-do` reaches a migration-declared Durable Object through `ctx.exports.DirectTool.getByName()` and invokes an RPC method on the resulting stub.
+
+Cloudflare OS uses this exact shape for `ctx.exports.AdminSettings.getByName("")` during `/api` startup. A self-exported Durable Object therefore has a dual surface: it is callable as a props-bearing `DurableObjectClass` for Facets and also exposes the normal namespace methods (`get`, `getByName`, `idFromName`, and related helpers).
 
 ## Run
 
@@ -46,7 +60,7 @@ Build celld, ensure `esbuild` and `curl` are on `PATH`, then:
 bash examples/cloudflare-os-compat/test.sh ./target/debug/celld
 ```
 
-The script starts `celld dev` with `CELLD_WORKER_LOADER=LOADER`, runs every case, prints a separate PASS/FAIL result, and exits non-zero if any case fails.
+The script starts `celld dev` directly from the Wrangler config, runs every case, prints a separate PASS/FAIL result, and exits non-zero if any case fails.
 
 ## TDD rule
 

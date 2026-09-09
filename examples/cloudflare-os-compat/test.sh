@@ -24,8 +24,7 @@ trap cleanup EXIT
 cd "$ROOT"
 rm -rf .celld/dev
 
-CELLD_WORKER_LOADER=LOADER \
-  "$CELLD_BIN" dev --host 127.0.0.1 --port "$PORT" --logs >"$LOG" 2>&1 &
+"$CELLD_BIN" dev --host 127.0.0.1 --port "$PORT" --logs >"$LOG" 2>&1 &
 PID=$!
 
 base="http://127.0.0.1:$PORT"
@@ -67,6 +66,10 @@ run_case() {
 
 run_case "plain dynamic worker" "/plain" 'plain-dynamic-worker'
 
+# Config-level compatibility used by the real Workshop backend.
+run_case "Wrangler JSON var" "/json-var" '"enabled":true'
+run_case "KV preview_id" "/kv-preview" 'preview-id'
+
 # First isolate the transport problem from ctx.props semantics.
 run_case "service env transport" "/service?value=hello" 'service:hello'
 
@@ -77,9 +80,29 @@ run_case "service env with props" "/capability?value=hello" 'capability:hello'
 # as an argument to the loaded Code Mode Worker.
 run_case "transient RPC argument" "/transient" 'transient:hello'
 
+# Cloudflare OS Code Mode attaches a props-bearing tail ServiceStub to each
+# loaded worker and waits for its TraceItem after verify()/run().
+run_case "loader tail trace" "/tail" '"method":"run","log":"tail-probe"'
+
 # Cloudflare OS Gatekeepers instantiate props-bearing DurableObjectClass values
 # from ctx.exports and hand them to ctx.facets.get().
 run_case "ctx.exports facet class" "/facet" 'facet:hello'
+
+# Cloudflare OS reaches ordinary exported Durable Objects through the same
+# ctx.exports surface, using namespace-style getByName()/get() methods.
+run_case "ctx.exports DO namespace" "/ctx-exports-do" 'direct:hello'
+
+# Cloudflare OS Durable Objects return RpcTarget capabilities (e.g. Overseer.open()).
+# The caller must be able to invoke the returned stub from another isolate.
+run_case "DO returns RPC target" "/do-return-rpc" 'returned:hello'
+
+# Cloudflare OS wraps facet stubs in a Proxy that emulates RpcTarget and synthesizes
+# wildcard methods from its get trap before wrapping it in a native RpcStub.
+run_case "Proxy-emulated RPC target" "/proxy-rpc-target" 'proxy:hello'
+
+# Cloudflare OS Gadget server.js modules export only a named DurableObject class;
+# Loader must accept them even though they have no stateless default export.
+run_case "Loader DO-only module" "/loader-do-only" 'do-only:hello'
 
 if [[ "$failures" -ne 0 ]]; then
   echo >&2

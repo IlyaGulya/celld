@@ -1,4 +1,4 @@
-import { DurableObject, RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
+import { DurableObject, RpcStub, RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
 
 // This example is intentionally modeled after the primitives Cloudflare OS
 // relies on for Code Mode and Gatekeepers. Keep it small: if this works, we
@@ -16,15 +16,33 @@ export class EchoTool extends WorkerEntrypoint {
   }
 }
 
+export class TailSink extends WorkerEntrypoint {
+  async tail(events) {
+    await this.env.TEST_KV.put("tail-trace", JSON.stringify(events[0]));
+  }
+}
+
 class TransientTool extends RpcTarget {
   echo(value) {
     return `transient:${value}`;
   }
 }
 
+class ReturnedTool extends RpcTarget {
+  echo(value) {
+    return `returned:${value}`;
+  }
+}
+
 export class FacetTool extends DurableObject {
   async echo(value) {
     return `${this.ctx.props.prefix}:${value}`;
+  }
+}
+
+export class DirectTool extends DurableObject {
+  echo(value) {
+    return `direct:${value}`;
   }
 }
 
@@ -44,6 +62,25 @@ export class FacetHost extends DurableObject {
 
   async call(value) {
     return this.#tool().echo(value);
+  }
+
+  returnTool() {
+    return new ReturnedTool();
+  }
+
+  async callLoaderDoOnly(value) {
+    const worker = this.env.LOADER.load({
+      compatibilityDate: "2026-09-07",
+      mainModule: "worker.js",
+      modules: { "worker.js": DO_ONLY_DYNAMIC_WORKER },
+      globalOutbound: null,
+    });
+    const cls = worker.getDurableObjectClass("Gadget");
+    const facet = this.ctx.facets.get("do-only", () => ({
+      id: "do-only",
+      class: cls,
+    }));
+    return facet.echo(value);
   }
 }
 
@@ -74,6 +111,26 @@ export default class extends WorkerEntrypoint {
 }
 `;
 
+const TAIL_DYNAMIC_WORKER = `
+import { WorkerEntrypoint } from "cloudflare:workers";
+
+export default class extends WorkerEntrypoint {
+  run() {
+    console.log("tail-probe");
+    return "done";
+  }
+}
+`;
+
+const DO_ONLY_DYNAMIC_WORKER = `
+import { DurableObject } from "cloudflare:workers";
+export class Gadget extends DurableObject {
+  echo(value) {
+    return "do-only:" + value;
+  }
+}
+`;
+
 function load(env, code, extraEnv = {}) {
   return env.LOADER.load({
     compatibilityDate: "2026-09-07",
@@ -90,6 +147,15 @@ export default {
 
     if (url.pathname === "/plain") {
       return load(env, PLAIN_DYNAMIC_WORKER).getEntrypoint().fetch(request);
+    }
+
+    if (url.pathname === "/json-var") {
+      return Response.json(env.JSON_CONFIG);
+    }
+
+    if (url.pathname === "/kv-preview") {
+      await env.TEST_KV.put("smoke", "preview-id");
+      return Response.json({ result: await env.TEST_KV.get("smoke") });
     }
 
     if (url.pathname === "/service") {
@@ -120,13 +186,59 @@ export default {
       return Response.json({ result });
     }
 
+    if (url.pathname === "/tail") {
+      await env.TEST_KV.delete("tail-trace");
+      const worker = env.LOADER.load({
+        compatibilityDate: "2026-09-07",
+        mainModule: "worker.js",
+        modules: { "worker.js": TAIL_DYNAMIC_WORKER },
+        tails: [ctx.exports.TailSink],
+        globalOutbound: null,
+      });
+      await worker.getEntrypoint().run();
+      const raw = await env.TEST_KV.get("tail-trace");
+      const trace = raw === null ? null : JSON.parse(raw);
+      return Response.json({
+        method: trace?.event?.rpcMethod,
+        log: trace?.logs?.[0]?.message?.[0],
+      });
+    }
+
     if (url.pathname === "/facet") {
       const host = env.FACET_HOST.getByName("cloudflare-os-compat");
       return Response.json({ result: await host.call("hello") });
     }
 
+    if (url.pathname === "/ctx-exports-do") {
+      const tool = ctx.exports.DirectTool.getByName("direct-tool");
+      return Response.json({ result: await tool.echo("hello") });
+    }
+
+    if (url.pathname === "/do-return-rpc") {
+      const host = env.FACET_HOST.getByName("rpc-return");
+      const tool = await host.returnTool();
+      return Response.json({ result: await tool.echo("hello") });
+    }
+
+    if (url.pathname === "/proxy-rpc-target") {
+      const target = new Proxy({}, {
+        getPrototypeOf() { return RpcTarget.prototype; },
+        get(_target, prop) {
+          if (prop === "greet") return (name) => `proxy:${name}`;
+          return undefined;
+        },
+      });
+      using stub = new RpcStub(target);
+      return Response.json({ result: await stub.greet("hello") });
+    }
+
+    if (url.pathname === "/loader-do-only") {
+      const host = env.FACET_HOST.getByName("loader-do-only");
+      return Response.json({ result: await host.callLoaderDoOnly("hello") });
+    }
+
     return Response.json({
-      endpoints: ["/plain", "/service", "/capability", "/transient", "/facet"],
+      endpoints: ["/plain", "/json-var", "/kv-preview", "/service", "/capability", "/transient", "/tail", "/facet", "/ctx-exports-do", "/do-return-rpc", "/proxy-rpc-target", "/loader-do-only"],
     });
   },
 };

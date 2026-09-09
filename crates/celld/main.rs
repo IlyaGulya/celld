@@ -4084,6 +4084,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                     asset_binding: None,
                     assets: None,
                     services: Vec::new(),
+                    loader_bindings: Vec::new(),
                     crons,
                 }),
                 GenerationOptions {

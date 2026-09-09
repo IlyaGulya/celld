@@ -543,12 +543,34 @@ const __fmt = (a) => a.map((x) => {
   try { return JSON.stringify(x); } catch { return String(x); }
 }).join(" ");
 const __consoleNoop = () => {};
+const __tailCaptures = new Map();
+const __tailPart = (value) => {
+  if (value === null || value === undefined ||
+      typeof value === "string" || typeof value === "number" ||
+      typeof value === "boolean") return value;
+  if (value instanceof Error) return value.stack || `${value.name}: ${value.message}`;
+  if (typeof value === "bigint" || typeof value === "symbol" ||
+      typeof value === "function") return String(value);
+  try { return JSON.parse(JSON.stringify(value)); } catch { return String(value); }
+};
+const __consoleEmit = (level, args) => {
+  const capture = __tailCaptures.get(__ctxNow());
+  if (capture !== undefined) {
+    capture.logs.push({
+      timestamp: Date.now(),
+      level,
+      message: args.map(__tailPart),
+    });
+  }
+  const prefix = level === "error" ? "ERROR " : level === "warn" ? "WARN " : "";
+  __log(prefix + __fmt(args));
+};
 globalThis.console = {
-  debug: (...a) => __log(__fmt(a)),
-  error: (...a) => __log("ERROR " + __fmt(a)),
-  info: (...a) => __log(__fmt(a)),
-  log: (...a) => __log(__fmt(a)),
-  warn: (...a) => __log("WARN " + __fmt(a)),
+  debug: (...a) => __consoleEmit("debug", a),
+  error: (...a) => __consoleEmit("error", a),
+  info: (...a) => __consoleEmit("info", a),
+  log: (...a) => __consoleEmit("log", a),
+  warn: (...a) => __consoleEmit("warn", a),
   clear: __consoleNoop,
   count: __consoleNoop,
   group: __consoleNoop,
@@ -2798,28 +2820,24 @@ globalThis.__makeLoader = () => {
     return { config: { ...c, modules }, wasm };
   };
   // Turn durable loopback ServiceStubs into data that a fresh isolate can
-  // reconstruct as an ordinary cross-script service binding. JSON.stringify
-  // would otherwise silently omit the function-valued stub from `env`.
-  //
-  // This intentionally handles only ctx.exports ServiceStubs here. Transient
-  // RpcStubs/RpcTargets require a real cross-isolate handle bridge and remain
-  // covered by a separate failing compatibility test.
+  // reconstruct as ordinary cross-script service bindings. Loader env permits
+  // plain JSON beside these descriptors; tails are ServiceStubs only and remain
+  // hidden from the loaded worker's env.
+  const encodeLoaderServiceStub = (value) => {
+    const svc = __svcMeta.get(value);
+    if (svc === undefined) return null;
+    const marker = {
+      "__celld$loaderSvc": svc.name,
+      s: __cell.script,
+    };
+    if (svc.props !== undefined) marker.p = svc.props;
+    return marker;
+  };
   const encodeLoaderEnv = (env) => {
     if (env === undefined) return undefined;
     const out = {};
-    for (const [name, value] of Object.entries(env)) {
-      const svc = __svcMeta.get(value);
-      if (svc === undefined) {
-        out[name] = value;
-        continue;
-      }
-      const marker = {
-        "__celld$loaderSvc": svc.name,
-        s: __cell.script,
-      };
-      if (svc.props !== undefined) marker.p = svc.props;
-      out[name] = marker;
-    }
+    for (const [name, value] of Object.entries(env))
+      out[name] = encodeLoaderServiceStub(value) ?? value;
     return out;
   };
 
@@ -2831,6 +2849,16 @@ globalThis.__makeLoader = () => {
         const { config, wasm } = encodeModules(c);
         if (config && typeof config === "object" && config.env !== undefined)
           config.env = encodeLoaderEnv(config.env);
+        if (config && typeof config === "object" && config.tails !== undefined) {
+          if (!Array.isArray(config.tails))
+            throw new TypeError("Worker Loader tails must be an array.");
+          config.tails = config.tails.map((tail) => {
+            const marker = encodeLoaderServiceStub(tail);
+            if (marker === null)
+              throw new TypeError("Worker Loader tails must be ServiceStubs.");
+            return marker;
+          });
+        }
         return __loader_load(JSON.stringify(config), wasm);
       });
   return {
@@ -3037,6 +3065,31 @@ const __ctxKey = Symbol("celld.ctx");
 const __ctxNow = () => {
   const frame = __als_get();
   return frame === undefined ? undefined : frame.get(__ctxKey);
+};
+
+const __tailBegin = (id, rpcMethod) => {
+  if (__cell.loaderTails.length === 0) return null;
+  const trace = {
+    event: { rpcMethod },
+    logs: [],
+    exceptions: [],
+  };
+  __tailCaptures.set(id, trace);
+  return trace;
+};
+const __tailException = (trace, error) => {
+  if (trace === null) return;
+  trace.exceptions.push({
+    timestamp: Date.now(),
+    message: String(error?.message ?? error),
+  });
+};
+const __tailFinish = async (id, trace) => {
+  __tailCaptures.delete(id);
+  if (trace === null) return;
+  await Promise.allSettled(
+    __cell.loaderTails.map((tail) => tail.tail([trace])),
+  );
 };
 // Run `fn` under context `id` (undefined = a fresh one). An async
 // fn started inside keeps the frame across its awaits. The prior
@@ -3247,13 +3300,21 @@ const __rpcNoSuchMethod = (prop) => new TypeError(
 const __rpcBindMethod = (value, receiver) =>
   Reflect.apply(Function.prototype.bind, value, [receiver]);
 const __stubResolve = (target, prop) => {
-  if (target instanceof __cf.RpcTarget) {
-    if (Object.hasOwn(target, prop) || !(prop in target) ||
-        prop in Object.prototype) throw __rpcNoSuchMethod(prop);
+  const rpcTarget = target instanceof __cf.RpcTarget;
+  if (rpcTarget) {
+    // A Proxy may emulate RpcTarget by reporting RpcTarget.prototype from its
+    // getPrototypeOf trap while synthesizing wildcard methods in its get trap.
+    // Cloudflare OS relies on this to wrap facet stubs for transport. In that
+    // case `prop in target` reflects the proxy target rather than the method
+    // surface, so it cannot be used as the existence test.
+    const proxyTarget = __util_proxy_details(target) !== undefined;
+    if (Object.hasOwn(target, prop) || prop in Object.prototype ||
+        (!proxyTarget && !(prop in target))) throw __rpcNoSuchMethod(prop);
   } else if (!Object.hasOwn(target, prop)) {
     throw __rpcNoSuchMethod(prop);
   }
   const value = target[prop];
+  if (rpcTarget && value === undefined) throw __rpcNoSuchMethod(prop);
   // Keep celld's own stubs and pipeline nodes unwrapped because the wrapper
   // would lose their metadata.
   return typeof value === "function" && !__stubMeta.has(value) &&
@@ -4167,9 +4228,20 @@ const __unwrapStoredMap = (v) => {
 // for ctx.facets.get(); env bindings remain DurableObjectNamespace objects.
 let __ctxExportsCache;
 let __selfLoaderId;
-const __selfDurableObjectClass = (name) => (options = {}) =>
-  __makeDurableObjectClass(
-    Promise.resolve(__selfLoaderId ??= __loader_self()), name, options);
+const __selfDurableObjectClass = (name) => {
+  const namespace = () => __cell.makeNamespace(name);
+  const cls = (options = {}) =>
+    __makeDurableObjectClass(
+      Promise.resolve(__selfLoaderId ??= __loader_self()), name, options);
+  for (const method of [
+    "idFromName", "idFromString", "newUniqueId", "jurisdiction", "getByName", "get",
+  ]) {
+    Object.defineProperty(cls, method, {
+      value: (...args) => namespace()[method](...args),
+    });
+  }
+  return cls;
+};
 const __ctxExports = () => __ctxExportsCache ??= (() => {
   const out = {};
   for (const name of Object.keys(__cell.entrypoints))
@@ -4459,12 +4531,12 @@ class DurableObjectNamespace {
           (prop === "get" || prop === "put" || prop === "delete"))
         return __fetcherHelper(doFetch, prop);
       // Every cell RPC goes out through the host, whichever node owns the
-      // target. Same-process dispatch re-enters this isolate, where the
-      // abort and exit markers revive; bytes that land elsewhere revive as
-      // loud foreign stubs.
+      // target. Transient capabilities therefore use the process-local bridge
+      // transport rather than isolate-local markers; same-isolate stub calls
+      // keep their cheaper local path in __stubOp().
       return async (...args) => invoke(
         async () => __rpcDes(await __rpc_call(
-          scope, dispatchName ?? null, prop, __rpcOut(args, true),
+          scope, dispatchName ?? null, prop, __rpcOut(args, "bridge"),
         )),
       );
     }});
@@ -4599,11 +4671,9 @@ const __rpcTargetMethod = async (scope, method) => {
     throw new TypeError(method + " is not a function");
   return [inst, fn];
 };
-// The byte path always lifts stub-able values into the reply: the
-// markers carry the isolate token, so they revive only back in this
-// isolate (same-process routed dispatch re-enters it) and fail loudly
-// on use anywhere else. Callee exceptions cross in
-// the error envelope on every flavor.
+// The byte path upgrades stub-able values into bridge capabilities before the
+// reply leaves the cell isolate. This is required for Durable Object methods
+// that return RpcTargets, and symmetrically for transient callback arguments.
 globalThis.__dispatchRpc = async (scope, method, args) => {
   const actorEvent = __beginActorEvent(scope);
   try {
@@ -4626,7 +4696,7 @@ globalThis.__dispatchRpc = async (scope, method, args) => {
           }
           const [inst, fn] = await __rpcTargetMethod(scope, method);
           return fn.apply(inst, decoded.args);
-        }, true);
+        }, "bridge");
       } finally {
         for (const handle of decoded.received) __disposeStub(handle);
       }
@@ -4859,6 +4929,7 @@ const __entrypointOp = (name, path, argsSc, local, makeInst) => {
   const id = __nextCtxId++;
   return __ctxRun(id, () => (async () => {
   const decoded = argsSc === null ? null : __rpcDesArgs(argsSc);
+  const tailTrace = __tailBegin(id, path[0] ?? "");
   let scopedInst;
   if (makeInst === undefined && decoded !== null &&
       decoded.args !== null && !Array.isArray(decoded.args) &&
@@ -4910,7 +4981,12 @@ const __entrypointOp = (name, path, argsSc, local, makeInst) => {
       } finally {
         drain = __endEvent();
       }
-      return await result;
+      try {
+        return await result;
+      } catch (error) {
+        __tailException(tailTrace, error);
+        throw error;
+      }
     }, local);
     // Registered work drains before a plain reply. A
     // capability-bearing reply (tag 1) must not wait: a returned
@@ -4918,6 +4994,7 @@ const __entrypointOp = (name, path, argsSc, local, makeInst) => {
     // cannot finish until the caller pulls (returnReadableStream's
     // waitUntil writer would deadlock behind its own reply).
     if (reply[0] !== 1 && drain !== null) await drain;
+    await __tailFinish(id, tailTrace);
     // ctx.abort() during the call supersedes its result; the raw
     // reason rejects the caller (same isolate — identity holds).
     if (__abortedCtxs.size !== 0) {
@@ -4932,6 +5009,7 @@ const __entrypointOp = (name, path, argsSc, local, makeInst) => {
     if (reply[0] !== 1) __ctxEnd(id);
     return reply;
   } finally {
+    __tailCaptures.delete(id);
     if (decoded !== null)
       for (const handle of decoded.received) __disposeStub(handle);
   }
@@ -5151,6 +5229,7 @@ globalThis.__cell = {
   instances: {},
   facetConfigs: {},
   env: {},
+  loaderTails: [],
   idNames: {},
   namespaceKeys: {},
   node: "",

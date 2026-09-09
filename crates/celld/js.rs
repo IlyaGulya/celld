@@ -3949,6 +3949,13 @@ pub struct QueueConsumerRegistration {
     pub config: crate::protocol::QueueConsumerConfig,
 }
 
+#[derive(Clone)]
+struct LoaderTail {
+    script: String,
+    entrypoint: String,
+    props: Option<serde_json::Value>,
+}
+
 pub struct WorkerConfig {
     src: String,
     pub script_name: String,
@@ -3973,7 +3980,7 @@ pub struct WorkerConfig {
     declares_queue_consumer: bool,
     workflow_bindings: Vec<WorkflowBinding>,
     ai_binding: Option<String>,
-    vars: Vec<(String, String)>,
+    vars: Vec<(String, serde_json::Value)>,
     node: String,
     /// The worker's non-main modules, so the main module can import siblings.
     modules: Vec<(String, ModuleSource)>,
@@ -3982,14 +3989,17 @@ pub struct WorkerConfig {
     /// The target runs in this process; see [[service-bindings]].
     services: Vec<(String, String, Option<String>)>,
     asset_binding: Option<String>,
-    /// `env` name of the Worker Loader binding, if this Worker may spawn
+    /// `env` names of Worker Loader bindings this Worker may use to spawn
     /// dynamic isolates.
-    loader_binding: Option<String>,
+    loader_bindings: Vec<String>,
     /// Ambient outbound authority. Loaded workers may be denied.
     egress: EgressPolicy,
     /// Extra `env` values a loaded worker was handed, as a JSON object string
     /// merged onto its `env`. Loader-only; empty for normal workers.
     loader_env: Option<String>,
+    /// Hidden tail WorkerEntrypoints for a dynamically loaded Worker. These are
+    /// service descriptors, not env bindings, so executed code cannot reach them.
+    loader_tails: Vec<LoaderTail>,
     /// `triggers.crons` from the deployment. Empty for a loaded worker and for
     /// any script without cron triggers.
     pub crons: Vec<String>,
@@ -4036,7 +4046,7 @@ pub struct WorkerConfigOptions {
     pub queue_consumers: Vec<crate::protocol::QueueConsumerConfig>,
     pub workflow_bindings: Vec<WorkflowBinding>,
     pub ai_binding: Option<String>,
-    pub vars: Vec<(String, String)>,
+    pub vars: Vec<(String, serde_json::Value)>,
     pub node: String,
     pub modules: Vec<(String, ModuleSource)>,
     pub compat: Compat,
@@ -4092,9 +4102,10 @@ impl WorkerConfig {
             compat,
             services: Vec::new(),
             asset_binding: None,
-            loader_binding: None,
+            loader_bindings: Vec::new(),
             egress: EgressPolicy::Allow,
             loader_env: None,
+            loader_tails: Vec::new(),
             crons: Vec::new(),
             generation: 0,
             main_imports,
@@ -4136,9 +4147,15 @@ impl WorkerConfig {
         self
     }
 
-    /// Grant this Worker a Worker Loader binding at `env` name `binding`.
+    /// Grant this Worker one legacy Worker Loader binding.
     pub fn with_loader(mut self, binding: Option<String>) -> Self {
-        self.loader_binding = binding;
+        self.loader_bindings = binding.into_iter().collect();
+        self
+    }
+
+    /// Grant this Worker the deployment's Worker Loader bindings.
+    pub fn with_loaders(mut self, bindings: Vec<String>) -> Self {
+        self.loader_bindings = bindings;
         self
     }
 
@@ -4151,6 +4168,11 @@ impl WorkerConfig {
     /// Merge `env` (a JSON object string) onto a loaded worker's `env`.
     fn with_loader_env(mut self, env: Option<String>) -> Self {
         self.loader_env = env;
+        self
+    }
+
+    fn with_loader_tails(mut self, tails: Vec<LoaderTail>) -> Self {
+        self.loader_tails = tails;
         self
     }
 
@@ -7305,13 +7327,24 @@ impl Worker {
             // tell the harness which cells are local (route the rest cross-node)
             inject_routing(scope, node)?;
 
-            // entry fetch
+            // Entry fetch. A dynamically-loaded Worker may intentionally export
+            // only named DurableObject classes (Cloudflare OS Gadget server.js
+            // does exactly this). Keep normal deployed Workers strict, but give
+            // Loader-only modules a closed HTTP surface while preserving their
+            // named RPC/DO exports.
             let dk = v8::String::new(scope, "default").unwrap();
-            let default = ns
+            let default_value = ns
                 .get(scope, dk.into())
-                .ok_or_else(|| anyhow!("no default export"))?
-                .to_object(scope)
-                .ok_or_else(|| anyhow!("default not object"))?;
+                .ok_or_else(|| anyhow!("no default export"))?;
+            let loader_without_default =
+                script_name.starts_with("__loader:") && default_value.is_undefined();
+            let default = if loader_without_default {
+                v8::Object::new(scope)
+            } else {
+                default_value
+                    .to_object(scope)
+                    .ok_or_else(|| anyhow!("default not object"))?
+            };
             let fk = v8::String::new(scope, "fetch").unwrap();
             let fetch_value = default
                 .get(scope, fk.into())
@@ -7372,6 +7405,8 @@ impl Worker {
                     scope,
                     "(req) => globalThis.__dispatchEntrypointFetch('default', req)",
                 )?
+            } else if loader_without_default {
+                compile_fn(scope, "() => new Response('Not found', { status: 404 })")?
             } else {
                 return Err(anyhow!("fetch not fn"));
             };
@@ -8776,6 +8811,37 @@ fn op_loader_load(
             );
         }
     }
+    let loader_tails = match code.get("tails") {
+        None => Vec::new(),
+        Some(serde_json::Value::Array(tails)) => {
+            let mut out = Vec::with_capacity(tails.len());
+            for tail in tails {
+                let Some(tail) = tail.as_object() else {
+                    return loader_throw(
+                        scope,
+                        "worker loader: tail must be a ServiceStub descriptor",
+                    );
+                };
+                let Some(entrypoint) = tail.get("__celld$loaderSvc").and_then(|v| v.as_str())
+                else {
+                    return loader_throw(
+                        scope,
+                        "worker loader: tail has no ServiceStub entrypoint",
+                    );
+                };
+                let Some(script) = tail.get("s").and_then(|v| v.as_str()) else {
+                    return loader_throw(scope, "worker loader: tail has no ServiceStub script");
+                };
+                out.push(LoaderTail {
+                    script: script.to_string(),
+                    entrypoint: entrypoint.to_string(),
+                    props: tail.get("p").cloned(),
+                });
+            }
+            out
+        }
+        Some(_) => return loader_throw(scope, "worker loader: tails must be an array"),
+    };
     // globalOutbound: absent inherits the caller's authority, null denies
     // ambient egress, a Fetcher (broker) is not implemented yet.
     let egress = match code.get("globalOutbound") {
@@ -8809,6 +8875,7 @@ fn op_loader_load(
     }));
     compat.js_rpc = true;
     let id = LOADER_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let generation = current_generation(scope);
     let config = Arc::new(
         WorkerConfig::new(WorkerConfigOptions {
             src,
@@ -8829,8 +8896,10 @@ fn op_loader_load(
             modules,
             compat,
         })
+        .with_generation(generation)
         .with_egress(egress)
-        .with_loader_env(loader_env),
+        .with_loader_env(loader_env)
+        .with_loader_tails(loader_tails),
     );
     let handle = match tokio::runtime::Handle::try_current() {
         Ok(handle) => handle,

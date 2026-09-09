@@ -859,6 +859,9 @@ async fn load_worker_at_pointer(
         bindings(&manifest, "ai")
             .find_map(|binding| binding.get("name")?.as_str().map(str::to_string)),
     );
+    let loader_bindings = bindings(&manifest, "worker_loader")
+        .filter_map(|binding| binding.get("name")?.as_str().map(str::to_string))
+        .collect::<Vec<_>>();
     let services = service_bindings(&manifest);
     let vars = worker_vars(&manifest)?;
     let compat = crate::worker_compat(&manifest.raw_metadata);
@@ -915,6 +918,7 @@ async fn load_worker_at_pointer(
         asset_binding,
         assets,
         services,
+        loader_bindings,
         crons,
     })
 }
@@ -934,6 +938,7 @@ pub struct LoadedDeployment {
     pub asset_binding: Option<String>,
     pub assets: Option<crate::assets::AssetResolver>,
     pub services: Vec<(String, String, Option<String>)>,
+    pub loader_bindings: Vec<String>,
     /// `triggers.crons` from the manifest, driving the reserved cron cell.
     pub crons: Vec<String>,
 }
@@ -968,14 +973,25 @@ fn service_bindings(manifest: &Manifest) -> Vec<(String, String, Option<String>)
         .collect()
 }
 
-fn worker_vars(manifest: &Manifest) -> anyhow::Result<Vec<(String, String)>> {
+fn worker_vars(manifest: &Manifest) -> anyhow::Result<Vec<(String, serde_json::Value)>> {
     let mut vars = BTreeMap::new();
     for binding in bindings(manifest, "plain_text") {
         if let (Some(name), Some(value)) = (
             binding.get("name").and_then(serde_json::Value::as_str),
             binding.get("text").and_then(serde_json::Value::as_str),
         ) {
-            vars.insert(name.to_string(), value.to_string());
+            vars.insert(
+                name.to_string(),
+                serde_json::Value::String(value.to_string()),
+            );
+        }
+    }
+    for binding in bindings(manifest, "json") {
+        if let (Some(name), Some(value)) = (
+            binding.get("name").and_then(serde_json::Value::as_str),
+            binding.get("json"),
+        ) {
+            vars.insert(name.to_string(), value.clone());
         }
     }
     if let Ok(path) = std::env::var("CELLD_VARS_FILE") {
@@ -1001,7 +1017,10 @@ fn worker_vars(manifest: &Manifest) -> anyhow::Result<Vec<(String, String)>> {
                         .and_then(|value| value.strip_suffix('\''))
                 })
                 .unwrap_or(raw);
-            vars.insert(name.to_string(), value.to_string());
+            vars.insert(
+                name.to_string(),
+                serde_json::Value::String(value.to_string()),
+            );
         }
     }
     for (name, value) in std::env::vars() {
@@ -1009,7 +1028,7 @@ fn worker_vars(manifest: &Manifest) -> anyhow::Result<Vec<(String, String)>> {
             .strip_prefix("CELLD_VAR_")
             .filter(|name| !name.is_empty())
         {
-            vars.insert(name.to_string(), value);
+            vars.insert(name.to_string(), serde_json::Value::String(value));
         }
     }
     Ok(vars.into_iter().collect())

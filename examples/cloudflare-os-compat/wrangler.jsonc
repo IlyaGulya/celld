@@ -3,6 +3,15 @@
   "main": "index.js",
   "compatibility_date": "2026-09-07",
   "compatibility_flags": ["allow_irrevocable_stub_storage"],
+  "worker_loaders": [
+    { "binding": "LOADER" }
+  ],
+  "vars": {
+    "JSON_CONFIG": { "enabled": true, "name": "compat" }
+  },
+  "kv_namespaces": [
+    { "binding": "TEST_KV", "preview_id": "cloudflare-os-compat-kv" }
+  ],
   "durable_objects": {
     "bindings": [
       { "name": "FACET_HOST", "class_name": "FacetHost" }
@@ -11,7 +20,7 @@
   "migrations": [
     {
       "tag": "v1",
-      "new_sqlite_classes": ["FacetHost", "FacetTool"]
+      "new_sqlite_classes": ["FacetHost", "FacetTool", "DirectTool"]
     }
   ]
 }

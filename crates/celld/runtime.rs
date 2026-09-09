@@ -1107,6 +1107,7 @@ impl Generation {
             asset_binding,
             assets: primary_assets,
             services,
+            loader_bindings: mut primary_loaders,
             crons,
         } = primary;
         let mut assets = HashMap::new();
@@ -1134,11 +1135,16 @@ impl Generation {
             .collect();
         let default_do_class =
             (user_classes.len() == 1).then(|| Arc::from(user_classes[0].as_str()));
+        if let Some(legacy_loader) = loader_binding.as_ref() {
+            if !primary_loaders.contains(legacy_loader) {
+                primary_loaders.push(legacy_loader.clone());
+            }
+        }
         let config = Arc::new(
             WorkerConfig::new(worker)
                 .with_services(services)
                 .with_asset_binding(asset_binding)
-                .with_loader(loader_binding)
+                .with_loaders(primary_loaders)
                 .with_queue_consumers(queue_catalog.clone())
                 .with_crons(crons.clone())
                 .with_generation(id),
@@ -1182,16 +1188,23 @@ impl Generation {
                 asset_binding,
                 assets: target_assets,
                 services,
+                loader_bindings: mut target_loaders,
                 ..
             } = target;
             if let Some(resolver) = target_assets {
                 assets.insert(script.clone(), resolver);
             }
             let target_classes = options.do_classes.clone();
+            if let Some(legacy_loader) = loader_binding.as_ref() {
+                if !target_loaders.contains(legacy_loader) {
+                    target_loaders.push(legacy_loader.clone());
+                }
+            }
             let config = Arc::new(
                 WorkerConfig::new(options)
                     .with_services(services)
                     .with_asset_binding(asset_binding)
+                    .with_loaders(target_loaders)
                     .with_queue_consumers(queue_catalog.clone())
                     .with_generation(id),
             );

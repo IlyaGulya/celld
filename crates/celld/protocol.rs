@@ -61,6 +61,7 @@ pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] = &[
     FEATURE_R2_V1,
     FEATURE_WASM_V1,
     FEATURE_WORKFLOWS_V1,
+    FEATURE_WORKER_LOADER_V1,
 ];
 
 pub const FEATURE_ASSETS_V1: &str = "assets-v1";
@@ -80,6 +81,10 @@ pub const FEATURE_CRON_V1: &str = "cron-v1";
 pub const FEATURE_R2_V1: &str = "r2-v1";
 pub const FEATURE_SQLITE_VEC_V1: &str = "sqlite-vec-v1";
 pub const FEATURE_WASM_V1: &str = "wasm-v1";
+/// A deployment with one or more Worker Loader bindings. Without this gate an
+/// older node would accept the deployment, omit the binding from `env`, and
+/// fail only when Code Mode first tries to spawn a Dynamic Worker.
+pub const FEATURE_WORKER_LOADER_V1: &str = "worker-loader-v1";
 /// A deployment with `workflows` bindings. Required because a build without
 /// the reserved workflow cell would load the manifest, build an `env` missing
 /// the binding, and fail only when the application first calls `create()` —

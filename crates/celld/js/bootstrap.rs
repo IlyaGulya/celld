@@ -607,7 +607,8 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
             ));
         }
         for (name, value) in vars {
-            lines.push_str(&format!("e[{:?}] = {:?};\n", name, value));
+            let value = serde_json::to_string(value)?;
+            lines.push_str(&format!("e[{:?}] = {};\n", name, value));
         }
         if let Some(name) = asset_binding {
             lines.push_str(&format!(
@@ -615,13 +616,23 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
                 name, script_name
             ));
         }
-        if let Some(name) = config.loader_binding.as_deref() {
+        for name in &config.loader_bindings {
             lines.push_str(&format!("e[{:?}] = __makeLoader();\n", name));
         }
         // A loaded worker's caller-supplied `env` (plain JSON values only in
         // the walking skeleton) merges last, over the declared bindings.
         if let Some(env) = config.loader_env.as_deref() {
             lines.push_str(&format!("Object.assign(e, __reviveLoaderEnv({}));\n", env));
+        }
+        for tail in &config.loader_tails {
+            let props = match &tail.props {
+                Some(props) => serde_json::to_string(props)?,
+                None => "undefined".to_string(),
+            };
+            lines.push_str(&format!(
+                "__cell.loaderTails.push(__makeServiceBinding({:?}, {:?}, {}));\n",
+                tail.script, tail.entrypoint, props,
+            ));
         }
         lines.push_str("})();");
         lines
