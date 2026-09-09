@@ -621,7 +621,7 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
         // A loaded worker's caller-supplied `env` (plain JSON values only in
         // the walking skeleton) merges last, over the declared bindings.
         if let Some(env) = config.loader_env.as_deref() {
-            lines.push_str(&format!("Object.assign(e, {});\n", env));
+            lines.push_str(&format!("Object.assign(e, __reviveLoaderEnv({}));\n", env));
         }
         lines.push_str("})();");
         lines

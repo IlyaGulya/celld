@@ -19,13 +19,16 @@
 //! reached without the permit would park a tokio worker on V8, which is the
 //! one thing this runtime refuses to do.
 
+use std::cell::Cell;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::RwLock;
+use std::sync::Weak;
 
 use anyhow::Result;
 use celld_logic::isolate::HeapId;
@@ -43,6 +46,54 @@ use crate::js;
 /// would reproduce the collision this identity prevents. The core treats the
 /// value as opaque, so its allocation order is not a deterministic decision.
 static NEXT_HEAP_ID: AtomicU64 = AtomicU64::new(1);
+
+static SLOT_REGISTRY: OnceLock<RwLock<std::collections::HashMap<HeapId, Weak<Slot>>>> =
+    OnceLock::new();
+
+thread_local! {
+    static CURRENT_HEAP: Cell<Option<HeapId>> = const { Cell::new(None) };
+}
+
+struct CurrentHeapGuard(Option<HeapId>);
+
+impl CurrentHeapGuard {
+    fn enter(heap: HeapId) -> Self {
+        Self(CURRENT_HEAP.with(|current| current.replace(Some(heap))))
+    }
+}
+
+impl Drop for CurrentHeapGuard {
+    fn drop(&mut self) {
+        CURRENT_HEAP.with(|current| current.set(self.0.take()));
+    }
+}
+
+fn slot_registry() -> &'static RwLock<std::collections::HashMap<HeapId, Weak<Slot>>> {
+    SLOT_REGISTRY.get_or_init(|| RwLock::new(std::collections::HashMap::new()))
+}
+
+fn register_slot(slot: &Arc<Slot>) {
+    slot_registry()
+        .write()
+        .expect("slot registry poisoned")
+        .insert(slot.heap_id, Arc::downgrade(slot));
+}
+
+pub(crate) fn current_slot() -> Option<Arc<Slot>> {
+    let heap = CURRENT_HEAP.with(Cell::get)?;
+    let slot = slot_registry()
+        .read()
+        .expect("slot registry poisoned")
+        .get(&heap)
+        .and_then(Weak::upgrade);
+    if slot.is_none() {
+        slot_registry()
+            .write()
+            .expect("slot registry poisoned")
+            .remove(&heap);
+    }
+    slot
+}
 
 fn next_heap_id() -> HeapId {
     let value = NEXT_HEAP_ID
@@ -228,6 +279,14 @@ pub struct Slot {
     turn_observations: Mutex<Vec<String>>,
 }
 
+impl Drop for Slot {
+    fn drop(&mut self) {
+        if let Ok(mut registry) = slot_registry().write() {
+            registry.remove(&self.heap_id);
+        }
+    }
+}
+
 impl Slot {
     fn observe(&self) -> IsolateLoad {
         IsolateLoad {
@@ -269,6 +328,7 @@ impl Slot {
             Some(worker) => worker,
             None => panic!("entered isolate {} after it was freed", self.id),
         };
+        let _heap = CurrentHeapGuard::enter(self.heap_id);
         #[cfg(celld_internal_tests)]
         self.turn_observations.lock().unwrap().push(match lane {
             TurnLane::Stateless => "stateless".to_string(),
@@ -361,7 +421,7 @@ impl Slot {
     /// A dynamic Worker owns exactly one isolate, so it needs no
     /// admission, growth, or retirement policy.
     pub(crate) fn standalone(worker: js::Worker) -> Arc<Self> {
-        Arc::new(Slot {
+        let slot = Arc::new(Slot {
             id: 0,
             heap_id: next_heap_id(),
             worker: tokio::sync::Mutex::new(Some(worker)),
@@ -374,7 +434,9 @@ impl Slot {
             retiring: AtomicBool::new(false),
             #[cfg(celld_internal_tests)]
             turn_observations: Mutex::new(Vec::new()),
-        })
+        });
+        register_slot(&slot);
+        slot
     }
 
     #[cfg(celld_internal_tests)]
@@ -581,6 +643,7 @@ impl Pool {
             #[cfg(celld_internal_tests)]
             turn_observations: Mutex::new(Vec::new()),
         });
+        register_slot(&slot);
         if let Some(id) = reusable {
             slots[id] = slot.clone();
         } else {

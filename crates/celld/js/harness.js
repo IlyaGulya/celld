@@ -2738,7 +2738,7 @@ globalThis.__makeLoader = () => {
             "yet.");
         const id = await idPromise;
         return __rpcDes(
-          await __loader_rpc(id, entrypoint, path[0], __rpcOut(args, false)));
+          await __loader_rpc(id, entrypoint, path[0], __rpcOut(args, "bridge")));
       })(),
     };
     return new Proxy(target, {
@@ -2797,12 +2797,40 @@ globalThis.__makeLoader = () => {
     }
     return { config: { ...c, modules }, wasm };
   };
+  // Turn durable loopback ServiceStubs into data that a fresh isolate can
+  // reconstruct as an ordinary cross-script service binding. JSON.stringify
+  // would otherwise silently omit the function-valued stub from `env`.
+  //
+  // This intentionally handles only ctx.exports ServiceStubs here. Transient
+  // RpcStubs/RpcTargets require a real cross-isolate handle bridge and remain
+  // covered by a separate failing compatibility test.
+  const encodeLoaderEnv = (env) => {
+    if (env === undefined) return undefined;
+    const out = {};
+    for (const [name, value] of Object.entries(env)) {
+      const svc = __svcMeta.get(value);
+      if (svc === undefined) {
+        out[name] = value;
+        continue;
+      }
+      const marker = {
+        "__celld$loaderSvc": svc.name,
+        s: __cell.script,
+      };
+      if (svc.props !== undefined) marker.p = svc.props;
+      out[name] = marker;
+    }
+    return out;
+  };
+
   // getCode is deferred into a microtask so a throw (or async getCode)
   // surfaces as a rejection when the worker is first used, not at get()/load().
   const loadFrom = (getCode) =>
     Promise.resolve().then(getCode)
       .then((c) => {
         const { config, wasm } = encodeModules(c);
+        if (config && typeof config === "object" && config.env !== undefined)
+          config.env = encodeLoaderEnv(config.env);
         return __loader_load(JSON.stringify(config), wasm);
       });
   return {
@@ -2818,7 +2846,28 @@ globalThis.__makeLoader = () => {
   };
 };
 
-globalThis.__makeServiceBinding = (script, entrypoint = null) => {
+globalThis.__reviveLoaderEnv = (env) => {
+  const seen = new Map();
+  const revive = (value) => {
+    if (value === null || typeof value !== "object") return value;
+    const cached = seen.get(value);
+    if (cached !== undefined) return cached;
+    const entrypoint = value["__celld$loaderSvc"];
+    if (entrypoint !== undefined) {
+      return globalThis.__makeServiceBinding(
+        value.s, entrypoint, revive(value.p));
+    }
+    const out = Array.isArray(value) ? [] : {};
+    seen.set(value, out);
+    for (const [key, child] of Object.entries(value)) out[key] = revive(child);
+    return out;
+  };
+  return revive(env);
+};
+
+globalThis.__makeServiceBinding = (
+  script, entrypoint = null, props = undefined,
+) => {
   const target = {
   async fetch(input, init) {
     const req = new Request(input, init);
@@ -2939,7 +2988,8 @@ globalThis.__makeServiceBinding = (script, entrypoint = null) => {
   // directly at the binding is context-free (ctx null): awaiting it
   // starts a fresh session, as in Workerd.
   const session =
-    __entrypointSession(entrypoint, script === __cell.script, script);
+    __entrypointSession(
+      entrypoint, script === __cell.script, script, undefined, props);
   return new Proxy(target, {
     getPrototypeOf: () => __cf.ServiceStub.prototype,
     get: (base, prop) => {
@@ -3087,9 +3137,10 @@ const __ctxAbortCurrent =
 // A stub entry owns a local target; `refs` counts live handles
 // across dup()s. When the last handle is disposed the target's own
 // Symbol.dispose runs (async, matching Workerd's disposal callback).
-// Stubs cross same-isolate transports only (same-script entrypoint
-// RPC and same-process routed dispatch); a marker revived elsewhere fails
-// loudly on use instead of aliasing an unrelated local entry.
+// Stubs use an isolate-local fast path when sender and receiver share a heap.
+// Worker Loader boundaries explicitly upgrade transient handles to process-local
+// bridge capabilities; legacy foreign markers still fail loudly rather than
+// aliasing an unrelated local entry.
 // `ctx` records the owning request context: the entry's for
 // running its target, the handle's for the serialize-elsewhere
 // check.
@@ -3169,6 +3220,10 @@ const __disposeStub = (meta) => {
   __ctxUnregister(meta);
   const entry = meta.entry;
   if (--entry.refs > 0) return;
+  if (entry.bridge !== undefined) {
+    __rpc_bridge_drop(entry.bridge);
+    return;
+  }
   __stubEntries.delete(entry.id);
   const disposer = entry.target?.[Symbol.dispose];
   if (typeof disposer === "function")
@@ -3294,7 +3349,7 @@ const __liftStream = (v) => {
 // it. Passing an existing stub transfers its reference: the
 // sender's handle is disposed (dup() first to keep one) and the
 // receiver adopts it. Returns null when nothing was liftable.
-const __stubLift = (value) => {
+const __stubLift = (value, bridge = false) => {
   let lifted = false;
   // Capabilities (stubs, disposers) root the callee context;
   // by-value host types do not — they pick the 0x02 envelope.
@@ -3324,8 +3379,13 @@ const __stubLift = (value) => {
       if (meta.ctx !== ctx) throw __ctxError("Client");
       meta.disposed = true; // the ref moves to the receiver
       __ctxUnregister(meta);
-      const marker = { "__celld$stub": meta.entry.id,
-                       t: __stubIsolate, c: meta.callable };
+      const marker = meta.entry.bridge !== undefined
+        ? { "__celld$bridge": meta.entry.bridge, c: meta.callable }
+        : bridge
+          ? { "__celld$bridge": __rpc_bridge_export(meta.entry.id),
+              c: meta.callable }
+          : { "__celld$stub": meta.entry.id,
+              t: __stubIsolate, c: meta.callable };
       seen.set(v, marker);
       return marker;
     }
@@ -3352,9 +3412,13 @@ const __stubLift = (value) => {
     if (typeof v === "function" || v instanceof __cf.RpcTarget) {
       lifted = true;
       caps = true;
-      const marker = { "__celld$stub": __newEntry(v).id,
-                       t: __stubIsolate,
-                       c: typeof v === "function" };
+      const entry = __newEntry(v);
+      const marker = bridge
+        ? { "__celld$bridge": __rpc_bridge_export(entry.id),
+            c: typeof v === "function" }
+        : { "__celld$stub": entry.id,
+            t: __stubIsolate,
+            c: typeof v === "function" };
       seen.set(v, marker);
       return marker;
     }
@@ -3545,6 +3609,14 @@ const __stubRevive = (value) => {
   const seen = new Set();
   const revive = (v) => {
     if (v === null || typeof v !== "object") return v;
+    const bridgeId = v["__celld$bridge"];
+    if (bridgeId !== undefined) {
+      const entry = { bridge: bridgeId, refs: 1 };
+      const stub = __makeStub(entry, v.c);
+      const meta = __stubMeta.get(stub);
+      if (meta) handles.push(meta);
+      return stub;
+    }
     const stubId = v["__celld$stub"];
     if (stubId !== undefined) {
       const entry = v.t === __stubIsolate
@@ -3605,7 +3677,7 @@ const __stubRevive = (value) => {
   };
   return { value: revive(value), handles, disposers };
 };
-// A marker that crossed an isolate boundary: fail on use, loudly.
+// A legacy isolate-local marker that crossed without bridge export: fail loudly.
 const __foreignStub = () => new Proxy(function () {}, {
   get: (_b, prop) => {
     if (prop === "then" || typeof prop !== "string") return undefined;
@@ -3695,6 +3767,11 @@ const __rpcWalk = async (root, path, args, entrypointRoot) => {
 const __stubOp = (meta, path, args) => {
   if (meta.disposed) return Promise.reject(__stubDisposedError());
   const entry = meta.entry;
+  if (entry.bridge !== undefined) {
+    const argsSc = args === null ? null : __rpcOut(args, "bridge");
+    return (async () => __rpcDes(await __rpc_bridge_call(
+      entry.bridge, JSON.stringify(path), argsSc)))();
+  }
   // The cell that minted this stub left residency, so `entry.target`
   // belongs to an instance this node released. The stub fails here
   // rather than calling into it.
@@ -3760,6 +3837,35 @@ const __stubOp = (meta, path, args) => {
       (error) => { untrack(); reject(error); });
   });
 };
+globalThis.__dispatchBridgeRpc = async (stubId, pathJson, argsSc, dropHandle) => {
+  const entry = __stubEntries.get(Number(stubId));
+  if (entry === undefined) throw __stubDisposedError();
+  if (dropHandle) {
+    if (--entry.refs <= 0) {
+      __stubEntries.delete(entry.id);
+      const disposer = entry.target?.[Symbol.dispose];
+      if (typeof disposer === "function")
+        Promise.resolve().then(() => disposer.call(entry.target));
+    }
+    return __rpcOut(undefined, false);
+  }
+  if (entry.released) throw __releasedStubError();
+  if (__abortedCtxs.size !== 0) {
+    const aborted = __abortedCtxs.get(entry.ctx);
+    if (aborted !== undefined) throw __postAbortError(aborted);
+  }
+  const path = JSON.parse(pathJson);
+  const decoded = argsSc === null ? null : __rpcDesArgs(argsSc);
+  try {
+    return await __ctxRun(entry.ctx, () => __rpcRun(async () =>
+      __rpcWalk(entry.target, path,
+        decoded === null ? null : decoded.args, false), "bridge"));
+  } finally {
+    if (decoded !== null)
+      for (const handle of decoded.received) __disposeStub(handle);
+  }
+};
+
 // Resolve a path against a local, already-revived value. A hop
 // landing on a same-isolate stub delegates the rest of the path
 // to the stub's target; everything else is a plain [[Get]] so
@@ -3803,7 +3909,9 @@ const __stubSession = (meta) => ({
   get: (path) => __stubOp(meta, path, null),
   call: (path, args) => __stubOp(meta, path, args),
 });
-const __entrypointSession = (name, local, script, makeInst) => ({
+const __entrypointSession = (
+  name, local, script, makeInst, remoteProps,
+) => ({
   get: (path) => local
     ? (async () => __rpcDes(
         await __entrypointOp(name, path, null, true, makeInst)))()
@@ -3811,7 +3919,10 @@ const __entrypointSession = (name, local, script, makeInst) => ({
         "Awaitable properties on cross-script service bindings " +
         "are not supported yet.")),
   call: (path, args) => (async () => {
-    const argsSc = __rpcOut(args, local);
+    const wireArgs = !local && remoteProps !== undefined
+      ? { "__celld$entrypointCall": true, p: remoteProps, a: args }
+      : args;
+    const argsSc = __rpcOut(wireArgs, local);
     if (local)
       return __rpcDes(await __entrypointOp(
         name, path, argsSc, true, makeInst));
@@ -4050,10 +4161,15 @@ const __unwrapStoredMap = (v) => {
     map.set(key, __unwrapStored(value));
   return map;
 };
-// ctx.exports: loopback stubs for every exported entrypoint plus
-// this worker's Durable Object namespaces. Built once, on first
-// access — ctx construction itself only carries the getter.
+// ctx.exports: loopback stubs for exported WorkerEntrypoints and callable
+// DurableObjectClass factories for this worker's own DO classes. Workerd's
+// ctx.exports.SomeDurableObject({ props }) returns a class descriptor suitable
+// for ctx.facets.get(); env bindings remain DurableObjectNamespace objects.
 let __ctxExportsCache;
+let __selfLoaderId;
+const __selfDurableObjectClass = (name) => (options = {}) =>
+  __makeDurableObjectClass(
+    Promise.resolve(__selfLoaderId ??= __loader_self()), name, options);
 const __ctxExports = () => __ctxExportsCache ??= (() => {
   const out = {};
   for (const name of Object.keys(__cell.entrypoints))
@@ -4061,8 +4177,9 @@ const __ctxExports = () => __ctxExportsCache ??= (() => {
   for (const name of Object.keys(__cell.objectEntrypoints))
     if (name !== "default")
       out[name] = __entrypointStub(name, undefined);
-  for (const name of Object.keys(__cell.namespaceKeys))
-    out[name] = __cell.makeNamespace(name);
+  for (const name of Object.keys(__cell.doExports))
+    if (!name.startsWith("__") && name !== ".cron")
+      out[name] = __selfDurableObjectClass(name);
   return out;
 })();
 // ---- RPC envelope ----------------------------------------------
@@ -4073,7 +4190,7 @@ const __rpcOut = (value, lift) => {
   try {
     return __sc_encode(value);
   } catch (error) {
-    const lifted = lift ? __stubLift(value) : null;
+    const lifted = lift ? __stubLift(value, lift === "bridge") : null;
     if (lifted === null) throw __dataCloneError(error);
     try {
       return __tagged(
@@ -4742,6 +4859,28 @@ const __entrypointOp = (name, path, argsSc, local, makeInst) => {
   const id = __nextCtxId++;
   return __ctxRun(id, () => (async () => {
   const decoded = argsSc === null ? null : __rpcDesArgs(argsSc);
+  let scopedInst;
+  if (makeInst === undefined && decoded !== null &&
+      decoded.args !== null && !Array.isArray(decoded.args) &&
+      decoded.args["__celld$entrypointCall"] === true &&
+      Array.isArray(decoded.args.a)) {
+    const props = decoded.args.p;
+    decoded.args = decoded.args.a;
+    makeInst = () => {
+      if (scopedInst !== undefined) return scopedInst;
+      const cls = __cell.entrypoints[name];
+      if (typeof cls !== "function")
+        throw new TypeError(
+          "The entrypoint " + name + " cannot carry props.");
+      const ctx = __beginEvent(props);
+      try {
+        scopedInst = new cls(ctx, __cell.env);
+      } finally {
+        __endEvent();
+      }
+      return scopedInst;
+    };
+  }
   let drain = null;
   try {
     const reply = await __rpcRun(async () => {

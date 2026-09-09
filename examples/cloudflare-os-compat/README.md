@@ -12,7 +12,11 @@ It is intentionally smaller than Cloudflare OS itself. The goal is to make missi
 
 This is the control case. If it fails, the Worker Loader itself is not usable for Cloudflare OS.
 
-### 2. Cross-isolate capability binding
+### 2. Service binding transport
+
+`/service` passes a plain `ctx.exports` `ServiceStub` through a Dynamic Worker's `env` and calls it from the loaded isolate. This isolates basic cross-isolate service transport from per-instance props.
+
+### 3. Props-bearing service capability
 
 `/capability` follows Cloudflare's documented custom-binding pattern:
 
@@ -20,13 +24,19 @@ This is the control case. If it fails, the Worker Loader itself is not usable fo
 2. that RPC stub is passed to `env.LOADER.load({ env: { TOOL: stub } })`;
 3. the Dynamic Worker calls `env.TOOL.echo()`.
 
-This is the primitive tracked by `denoland/celld#174` and required by Cloudflare OS Code Mode to call scoped tools without replacing capabilities with broad bearer-token HTTP APIs.
+Cloudflare OS uses this shape for scoped Gadget/Gatekeeper loopbacks.
 
-### 3. `ctx.exports` Durable Object facet class
+### 4. Transient `RpcTarget` argument
+
+`/transient` passes a request-scoped `RpcTarget` as an argument to a loaded Worker entrypoint. The loaded isolate calls the capability back in the originating isolate through the process-local RPC bridge while preserving the originating request context.
+
+This is the primitive tracked by `denoland/celld#174` and required by Cloudflare OS Code Mode for capabilities such as `RestoreForgerImpl`; replacing it with a bearer-token HTTP endpoint would weaken the capability model.
+
+### 5. `ctx.exports` Durable Object facet class
 
 `/facet` creates a props-bearing `DurableObjectClass` using `ctx.exports.FacetTool({ props })` and passes it to `ctx.facets.get()`.
 
-Cloudflare OS uses this shape when instantiating Gatekeeper facets. celld v0.4.1 documents facet classes obtained from `ctx.exports` as unavailable.
+Cloudflare OS uses this shape when instantiating Gatekeeper facets.
 
 ## Run
 

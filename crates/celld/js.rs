@@ -5875,6 +5875,16 @@ fn begin<'s>(
             args,
             reply,
         } => return begin_entrypoint_rpc(tc, &entrypoint, &method, args, reply),
+        crate::WorkerJob::BridgeRpc {
+            stub_id,
+            path,
+            args,
+            context,
+            drop_handle,
+            reply,
+        } => {
+            return begin_bridge_rpc(tc, stub_id, &path, args, context, drop_handle, reply);
+        }
         crate::WorkerJob::Queue { batch, reply, .. } => {
             return begin_queue(tc, batch, reply);
         }
@@ -5972,6 +5982,81 @@ fn begin_entrypoint_rpc(
         let ret = f
             .call(tc, recv, &[entrypoint.into(), method.into(), args])
             .ok_or_else(|| anyhow!("entrypoint RPC threw"))?;
+        match ret.try_cast::<v8::Promise>() {
+            Ok(promise) => Ok(promise),
+            Err(_) => resolved_promise(tc, ret),
+        }
+    })();
+    let event_started = Instant::now();
+    match started {
+        Ok(promise) => {
+            tc.perform_microtask_checkpoint();
+            let entry = InFlight {
+                runtime_state: actor_runtime_state(tc),
+                promise: v8::Global::new(tc, promise),
+                context,
+                scope: None,
+                writes_before: None,
+                request_id: None,
+                active_request_id: None,
+                reply: Some(Answer::Rpc(reply)),
+                gated_reply: None,
+                background: None,
+                ops: std::collections::HashSet::new(),
+                io_context_ops: std::collections::HashSet::new(),
+                alarm: None,
+                started: event_started,
+                trace: None,
+                failure: None,
+            };
+            drop(guard);
+            Begun::Running(Box::new(entry))
+        }
+        Err(error) => {
+            let _ = end_event_context(tc);
+            let error = take_execution_termination(tc).unwrap_or(error);
+            drop(guard);
+            let _ = reply.send(Err(error));
+            Begun::Nothing
+        }
+    }
+}
+
+fn begin_bridge_rpc(
+    tc: &mut v8::PinScope,
+    stub_id: u64,
+    path: &[String],
+    args: Option<Vec<u8>>,
+    context: Arc<IoContext>,
+    drop_handle: bool,
+    reply: tokio::sync::oneshot::Sender<Result<Vec<u8>>>,
+) -> Begun {
+    let guard = CurrentGuard::enter(context.clone());
+    let global = tc.get_current_context().global(tc);
+    let started = (|| {
+        let key = v8::String::new(tc, "__dispatchBridgeRpc").unwrap();
+        let f: v8::Local<v8::Function> = global
+            .get(tc, key.into())
+            .ok_or_else(|| anyhow!("no __dispatchBridgeRpc"))?
+            .try_into()
+            .map_err(|_| anyhow!("__dispatchBridgeRpc is not a function"))?;
+        let stub_id = v8::Number::new(tc, stub_id as f64);
+        let path = serde_json::to_string(path)?;
+        let path = v8::String::new(tc, &path).ok_or_else(|| anyhow!("bridge RPC path"))?;
+        let args: v8::Local<v8::Value> = match args {
+            Some(args) => bytes_value(tc, args),
+            None => v8::null(tc).into(),
+        };
+        let drop_handle = v8::Boolean::new(tc, drop_handle);
+        let recv = v8::undefined(tc).into();
+        begin_event_context(tc)?;
+        let ret = f
+            .call(
+                tc,
+                recv,
+                &[stub_id.into(), path.into(), args, drop_handle.into()],
+            )
+            .ok_or_else(|| anyhow!("bridge RPC threw"))?;
         match ret.try_cast::<v8::Promise>() {
             Ok(promise) => Ok(promise),
             Err(_) => resolved_promise(tc, ret),
@@ -7633,9 +7718,13 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
         "__queue_alarm_set_wait" => op_queue_alarm_set_wait,
         "__alarm_get" => op_alarm_get,
         "__alarm_delete" => op_alarm_delete,
+        "__loader_self" => op_loader_self,
         "__loader_load" => op_loader_load,
         "__loader_fetch" => op_loader_fetch,
         "__loader_rpc" => op_loader_rpc,
+        "__rpc_bridge_export" => op_rpc_bridge_export,
+        "__rpc_bridge_call" => op_rpc_bridge_call,
+        "__rpc_bridge_drop" => op_rpc_bridge_drop,
         "__loader_drop" => op_loader_drop,
         "__facet_fetch" => op_facet_fetch,
         "__facet_rpc" => op_facet_rpc,
@@ -8439,6 +8528,9 @@ enum LoaderState {
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct LoaderOwner(u64);
 
+#[derive(Clone, Copy)]
+struct SelfLoaderId(u64);
+
 impl LoaderOwner {
     fn fresh() -> Self {
         Self(LOADER_NEXT_OWNER.fetch_add(1, Ordering::Relaxed))
@@ -8459,6 +8551,21 @@ static LOADER_NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
 #[doc(hidden)]
 pub fn loader_registry() -> &'static std::sync::Mutex<LoaderRegistry> {
     LOADER_REGISTRY.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[derive(Clone)]
+struct RpcBridgeEntry {
+    slot: Weak<crate::pool::Slot>,
+    context: Arc<IoContext>,
+    stub_id: u64,
+}
+
+type RpcBridgeRegistry = HashMap<u64, RpcBridgeEntry>;
+static RPC_BRIDGE_REGISTRY: OnceLock<Mutex<RpcBridgeRegistry>> = OnceLock::new();
+static RPC_BRIDGE_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn rpc_bridge_registry() -> &'static Mutex<RpcBridgeRegistry> {
+    RPC_BRIDGE_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Remove the registry references for every child of `owner`. The caller
@@ -8495,6 +8602,61 @@ async fn loaded_worker_slot(
             .await
             .map_err(|_| "worker loader: load task dropped".to_string())?;
     }
+}
+
+/// `__loader_self()` -> stub id. Registers this deployment's own WorkerConfig
+/// as a loader-backed runtime once per isolate. This lets ctx.exports expose
+/// same-script DurableObjectClass values while reusing the existing facet
+/// storage/fencing path instead of creating a second facet runtime.
+fn op_loader_self(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    if let Some(id) = scope.get_slot::<SelfLoaderId>() {
+        rv.set(v8::Number::new(scope, id.0 as f64).into());
+        return;
+    }
+
+    let owner = *scope
+        .get_slot::<LoaderOwner>()
+        .expect("Worker isolate has a Loader owner");
+    let config = scope
+        .get_slot::<Arc<BundleFs>>()
+        .expect("Worker isolate has a bundle config")
+        .config
+        .clone();
+    let max = crate::env_vars::positive_or("CELLD_MAX_LOADED_WORKERS", 256)
+        .expect("validated CELLD_MAX_LOADED_WORKERS");
+    if loader_registry().lock().unwrap().len() >= max {
+        return loader_throw(
+            scope,
+            &format!("worker loader: too many loaded workers (limit {max})"),
+        );
+    }
+
+    let id = LOADER_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let handle = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle,
+        Err(error) => return loader_throw(scope, &format!("worker loader: {error}")),
+    };
+    let (loaded, state) = tokio::sync::watch::channel(LoaderState::Loading);
+    loader_registry()
+        .lock()
+        .unwrap()
+        .insert(id, LoaderEntry { owner, state });
+    scope.set_slot(SelfLoaderId(id));
+    handle.spawn(async move {
+        let state = match tokio::task::spawn_blocking(move || Worker::load_config(config)).await {
+            Ok(Ok(worker)) => LoaderState::Ready(crate::pool::Slot::standalone(worker)),
+            Ok(Err(error)) => LoaderState::Failed(Arc::from(format!("{error}"))),
+            Err(error) => LoaderState::Failed(Arc::from(format!(
+                "worker loader: load task failed: {error}"
+            ))),
+        };
+        loaded.send_replace(state);
+    });
+    rv.set(v8::Number::new(scope, id as f64).into());
 }
 
 /// `__loader_load(codeJson)` -> stub id. Builds a WorkerConfig from the
@@ -8818,6 +8980,102 @@ impl Drop for RequestBodyGuard {
         let claim = self.0.take();
         run_http_cleanup_from_drop(|| drop(claim));
     }
+}
+
+fn op_rpc_bridge_export(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let stub_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
+    let Some(slot) = crate::pool::current_slot() else {
+        return loader_throw(scope, "RPC bridge: no current isolate slot");
+    };
+    let id = RPC_BRIDGE_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    rpc_bridge_registry().lock().unwrap().insert(
+        id,
+        RpcBridgeEntry {
+            slot: Arc::downgrade(&slot),
+            context: current_context(),
+            stub_id,
+        },
+    );
+    rv.set(v8::Number::new(scope, id as f64).into());
+}
+
+fn op_rpc_bridge_call(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
+    let path: Vec<String> = match serde_json::from_str(&args.get(1).to_rust_string_lossy(scope)) {
+        Ok(path) => path,
+        Err(error) => {
+            return loader_throw(scope, &format!("RPC bridge: invalid path: {error}"));
+        }
+    };
+    let call_args = (!args.get(2).is_null()).then(|| view_bytes(args.get(2)).unwrap_or_default());
+    let bridge = rpc_bridge_registry().lock().unwrap().get(&id).cloned();
+    let async_id = asyncrt::enqueue(async move {
+        let bridge = bridge.ok_or_else(|| "RPC bridge: stale handle".to_string())?;
+        let slot = bridge
+            .slot
+            .upgrade()
+            .ok_or_else(|| "RPC bridge: origin isolate is gone".to_string())?;
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        let job = crate::WorkerJob::BridgeRpc {
+            stub_id: bridge.stub_id,
+            path,
+            args: call_args,
+            context: bridge.context,
+            drop_handle: false,
+            reply,
+        };
+        let driving = tokio::spawn(crate::runtime::drive(slot, job, None));
+        match receive.await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(error)) => Err(format!("{error}")),
+            Err(_) => match driving.await {
+                Err(error) => Err(format!("RPC bridge task died: {error}")),
+                Ok(()) => Err("RPC bridge dropped its result".to_string()),
+            },
+        }
+    });
+    rv.set(promise_for(scope, async_id));
+}
+
+fn op_rpc_bridge_drop(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
+    let bridge = rpc_bridge_registry().lock().unwrap().remove(&id);
+    let Some(bridge) = bridge else {
+        return;
+    };
+    let Some(slot) = bridge.slot.upgrade() else {
+        return;
+    };
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    handle.spawn(async move {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        let job = crate::WorkerJob::BridgeRpc {
+            stub_id: bridge.stub_id,
+            path: Vec::new(),
+            args: None,
+            context: bridge.context,
+            drop_handle: true,
+            reply,
+        };
+        let driving = tokio::spawn(crate::runtime::drive(slot, job, None));
+        if receive.await.is_err() {
+            let _ = driving.await;
+        }
+    });
 }
 
 /// `__loader_rpc(id, entrypoint, method, argsSc)` -> Promise<Uint8Array>. The

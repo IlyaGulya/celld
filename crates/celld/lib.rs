@@ -472,6 +472,14 @@ pub enum WorkerJob {
         args: Vec<u8>,
         reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<u8>>>,
     },
+    BridgeRpc {
+        stub_id: u64,
+        path: Vec<String>,
+        args: Option<Vec<u8>>,
+        context: std::sync::Arc<js::IoContext>,
+        drop_handle: bool,
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<u8>>>,
+    },
     Queue {
         queued_at: std::time::Instant,
         batch: js::QueueBatch,
