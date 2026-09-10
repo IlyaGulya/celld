@@ -186,6 +186,7 @@ for _ in $(seq 1 120); do
 done
 run_case "service binding with props" "/props" 'service-props:hello'
 run_case "returned service stub" "/returned-service-stub" 'returned-service:hello'
+run_case "returned service DO class" "/returned-do-class" 'remote-class:hello'
 if ws_output="$(node "$ROOT/ws-service-check.mjs" "ws://127.0.0.1:$PORT/" 2>&1)"; then
   printf 'PASS %-28s %s\n' "service WebSocket handoff" "$ws_output"
 else

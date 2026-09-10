@@ -1,5 +1,8 @@
 {
   "name": "cloudflare-os-ws-service",
   "main": "ws-service.js",
-  "compatibility_date": "2026-09-07"
+  "compatibility_date": "2026-09-07",
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["ChildDurableObject"] }
+  ]
 }
