@@ -111,6 +111,7 @@ run_case "ctx.exports DO namespace" "/ctx-exports-do" 'direct:hello'
 # Cloudflare OS Durable Objects return RpcTarget capabilities (e.g. Overseer.open()).
 # The caller must be able to invoke the returned stub from another isolate.
 run_case "DO returns RPC target" "/do-return-rpc" 'returned:hello'
+run_case "DO RPC promise pipeline" "/do-return-rpc-pipeline" 'returned:hello'
 
 # Cloudflare OS wraps facet stubs in a Proxy that emulates RpcTarget and synthesizes
 # wildcard methods from its get trap before wrapping it in a native RpcStub.

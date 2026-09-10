@@ -498,6 +498,11 @@ export default {
       return Response.json({ result: await tool.echo("hello") });
     }
 
+    if (url.pathname === "/do-return-rpc-pipeline") {
+      const host = env.FACET_HOST.getByName("rpc-return-pipeline");
+      return Response.json({ result: await host.returnTool().echo("hello") });
+    }
+
     if (url.pathname === "/proxy-rpc-target") {
       const target = new Proxy({}, {
         getPrototypeOf() { return RpcTarget.prototype; },
