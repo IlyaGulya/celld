@@ -1,10 +1,25 @@
 import { DurableObject } from "cloudflare:workers";
 
+
+export class ClassRelay extends DurableObject {
+  getClass(prefix) {
+    return this.env.PROPS.getChildClass(prefix);
+  }
+}
 export class ClassHost extends DurableObject {
   async call(value) {
     const cls = await this.env.PROPS.getChildClass("remote-class");
     const facet = this.ctx.facets.get("remote-class", () => ({
       id: "remote-class",
+      class: cls,
+    }));
+    return facet.echo(value);
+  }
+
+  async callRelayed(value) {
+    const cls = await this.env.CLASS_RELAY.getByName("relay").getClass("relayed-class");
+    const facet = this.ctx.facets.get("relayed-class", () => ({
+      id: "relayed-class",
       class: cls,
     }));
     return facet.echo(value);
@@ -22,6 +37,10 @@ export default {
     if (new URL(request.url).pathname === "/returned-do-class") {
       const host = env.CLASS_HOST.getByName("returned-do-class");
       return Response.json({ result: await host.call("hello") });
+    }
+    if (new URL(request.url).pathname === "/relayed-do-class") {
+      const host = env.CLASS_HOST.getByName("relayed-do-class");
+      return Response.json({ result: await host.callRelayed("hello") });
     }
     return env.SERVICE.fetch(request);
   },

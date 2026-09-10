@@ -52,7 +52,7 @@ run_case() {
   local name="$1" path="$2" expected="$3"
   local body_file status body
   body_file="$(mktemp)"
-  status="$(curl -sS -o "$body_file" -w '%{http_code}' "$base$path" || true)"
+  status="$(curl --max-time 15 -sS -o "$body_file" -w '%{http_code}' "$base$path" || true)"
   body="$(cat "$body_file")"
   rm -f "$body_file"
 
@@ -187,6 +187,7 @@ done
 run_case "service binding with props" "/props" 'service-props:hello'
 run_case "returned service stub" "/returned-service-stub" 'returned-service:hello'
 run_case "returned service DO class" "/returned-do-class" 'remote-class:hello'
+run_case "relayed service DO class" "/relayed-do-class" 'relayed-class:hello'
 if ws_output="$(node "$ROOT/ws-service-check.mjs" "ws://127.0.0.1:$PORT/" 2>&1)"; then
   printf 'PASS %-28s %s\n' "service WebSocket handoff" "$ws_output"
 else

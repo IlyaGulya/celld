@@ -4,11 +4,12 @@
   "compatibility_date": "2026-09-07",
   "durable_objects": {
     "bindings": [
-      { "name": "CLASS_HOST", "class_name": "ClassHost" }
+      { "name": "CLASS_HOST", "class_name": "ClassHost" },
+      { "name": "CLASS_RELAY", "class_name": "ClassRelay" }
     ]
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["ClassHost"] }
+    { "tag": "v1", "new_sqlite_classes": ["ClassHost", "ClassRelay"] }
   ],
   "services": [
     { "binding": "SERVICE", "service": "cloudflare-os-ws-service" },
