@@ -3909,10 +3909,18 @@ const __entrypointResolve = (inst, prop) => {
   if (__entrypointReserved.has(prop))
     throw new TypeError("'" + prop +
       "' is a reserved method and cannot be called over RPC.");
-  if (Object.hasOwn(inst, prop) || !(prop in inst) ||
-      prop in Object.prototype)
+  // Cloudflare OS GatekeeperLoopback returns a Proxy from a WorkerEntrypoint
+  // constructor. The Proxy reports WorkerEntrypoint.prototype while its `get`
+  // trap synthesizes the methods of the underlying gatekeeper session. Like an
+  // RpcTarget-emulating Proxy, `prop in inst` cannot be the existence test: the
+  // target object does not own the wildcard method even though [[Get]] returns it.
+  const proxyEntrypoint = __util_proxy_details(inst) !== undefined &&
+    Object.getPrototypeOf(inst) === __cf.WorkerEntrypoint.prototype;
+  if (Object.hasOwn(inst, prop) || prop in Object.prototype ||
+      (!proxyEntrypoint && !(prop in inst)))
     throw __rpcNoSuchMethod(prop);
   const value = inst[prop];
+  if (proxyEntrypoint && value === undefined) throw __rpcNoSuchMethod(prop);
   return typeof value === "function" && !__stubMeta.has(value) &&
       !(value instanceof __cf.RpcPromise) &&
       !(value instanceof __cf.RpcProperty)
