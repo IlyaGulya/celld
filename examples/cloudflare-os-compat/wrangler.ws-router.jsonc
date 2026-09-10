@@ -1,0 +1,22 @@
+{
+  "name": "cloudflare-os-ws-router",
+  "main": "ws-router.js",
+  "compatibility_date": "2026-09-07",
+  "durable_objects": {
+    "bindings": [
+      { "name": "CLASS_HOST", "class_name": "ClassHost" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["ClassHost"] }
+  ],
+  "services": [
+    { "binding": "SERVICE", "service": "cloudflare-os-ws-service" },
+    {
+      "binding": "PROPS",
+      "service": "cloudflare-os-ws-service",
+      "entrypoint": "PropsEntrypoint",
+      "props": { "prefix": "service-props" }
+    }
+  ]
+}
