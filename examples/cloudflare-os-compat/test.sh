@@ -188,6 +188,7 @@ run_case "service binding with props" "/props" 'service-props:hello'
 run_case "returned service stub" "/returned-service-stub" 'returned-service:hello'
 run_case "returned service DO class" "/returned-do-class" 'remote-class:hello'
 run_case "relayed service DO class" "/relayed-do-class" 'relayed-class:hello'
+run_case "Proxy WorkerEntrypoint" "/proxy-entrypoint" 'proxy-entrypoint:hello'
 if ws_output="$(node "$ROOT/ws-service-check.mjs" "ws://127.0.0.1:$PORT/" 2>&1)"; then
   printf 'PASS %-28s %s\n' "service WebSocket handoff" "$ws_output"
 else

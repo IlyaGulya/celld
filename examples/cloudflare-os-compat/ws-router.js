@@ -42,6 +42,9 @@ export default {
       const host = env.CLASS_HOST.getByName("relayed-do-class");
       return Response.json({ result: await host.callRelayed("hello") });
     }
+    if (new URL(request.url).pathname === "/proxy-entrypoint") {
+      return Response.json({ result: await env.PROXY_EP.runAt("hello") });
+    }
     return env.SERVICE.fetch(request);
   },
 };

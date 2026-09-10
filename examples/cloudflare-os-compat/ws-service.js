@@ -24,6 +24,22 @@ export class PropsEntrypoint extends WorkerEntrypoint {
     return this.ctx.exports.ChildDurableObject({ props: { prefix } });
   }
 }
+
+export class ProxyEntrypoint extends WorkerEntrypoint {
+  constructor(ctx, env) {
+    super(ctx, env);
+    return new Proxy({}, {
+      getPrototypeOf: () => WorkerEntrypoint.prototype,
+      get: (_target, prop) => {
+        if (prop === "then") return undefined;
+        if (prop === "runAt") return (value) => `proxy-entrypoint:${value}`;
+        return undefined;
+      },
+    });
+  }
+
+  dummyMethod() {}
+}
 export default {
   fetch(request) {
     if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {

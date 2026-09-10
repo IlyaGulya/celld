@@ -18,6 +18,11 @@
       "service": "cloudflare-os-ws-service",
       "entrypoint": "PropsEntrypoint",
       "props": { "prefix": "service-props" }
+    },
+    {
+      "binding": "PROXY_EP",
+      "service": "cloudflare-os-ws-service",
+      "entrypoint": "ProxyEntrypoint"
     }
   ]
 }
