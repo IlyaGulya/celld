@@ -63,6 +63,10 @@ export class FacetTool extends DurableObject {
   async callCapability(tool, value) {
     return tool.echo(value);
   }
+
+  failWithoutEcho(_sensitiveValue) {
+    throw new Error("deliberate structured compatibility failure");
+  }
 }
 
 export class DirectTool extends DurableObject {
@@ -87,6 +91,10 @@ export class FacetHost extends DurableObject {
 
   async call(value) {
     return this.#tool().echo(value);
+  }
+
+  async callFailure(sensitiveValue) {
+    return this.#tool().failWithoutEcho(sensitiveValue);
   }
 
   async callReturnedClass(value) {
@@ -422,6 +430,25 @@ export default {
       return load(env, CAPABILITY_DYNAMIC_WORKER, { TOOL: tool })
         .getEntrypoint()
         .fetch(request);
+    }
+
+    if (url.pathname === "/structured-error") {
+      const sensitiveValue = await request.text();
+      try {
+        const host = env.FACET_HOST.getByName("structured-error");
+        await host.callFailure(sensitiveValue);
+        return new Response("expected failure", { status: 500 });
+      } catch (error) {
+        console.error(JSON.stringify({
+          event: "compat.runtime.error",
+          name: String(error?.name ?? "Error"),
+          message: String(error?.message ?? error),
+        }));
+        return Response.json(
+          { error: String(error?.message ?? error) },
+          { status: 500 },
+        );
+      }
     }
 
     if (url.pathname === "/transient") {

@@ -77,6 +77,22 @@ run_case "service env transport" "/service?value=hello" 'service:hello'
 # Cloudflare OS uses props-bearing ServiceStubs for Gadget/Gatekeeper loopbacks.
 run_case "service env with props" "/capability?value=hello" 'capability:hello'
 
+# Runtime/application errors must be observable without dumping RPC/request payloads.
+sensitive="AGENTOS_COMPAT_SENSITIVE_PAYLOAD_DO_NOT_LOG"
+error_body_file="$(mktemp)"
+error_status="$(curl --max-time 15 -sS -X POST --data-binary "$sensitive" \
+  -o "$error_body_file" -w '%{http_code}' "$base/structured-error" || true)"
+error_body="$(cat "$error_body_file")"
+rm -f "$error_body_file"
+if [[ "$error_status" == "500" && "$error_body" == *"deliberate structured compatibility failure"* ]] && \
+   grep -Fq '"event":"compat.runtime.error"' "$LOG" && ! grep -Fq "$sensitive" "$LOG"; then
+  printf 'PASS %-28s HTTP %s structured event, payload redacted\n' "structured error redaction" "$error_status"
+else
+  printf 'FAIL %-28s HTTP %s %s\n' "structured error redaction" "$error_status" "$error_body" >&2
+  grep -F 'compat.runtime.error' "$LOG" >&2 || true
+  failures=$((failures + 1))
+fi
+
 # Cloudflare OS executeCode() passes a transient RpcTarget (RestoreForgerImpl)
 # as an argument to the loaded Code Mode Worker.
 run_case "transient RPC argument" "/transient" 'transient:hello'
