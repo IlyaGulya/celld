@@ -299,7 +299,7 @@ pub fn ws_pull_unregister(id: u64) {
 /// registration instead of leaving a socket that no isolate can reach.
 pub struct WorkerWebSocket {
     id: u64,
-    inbound: WsPullSender,
+    inbound: Option<WsPullSender>,
 }
 
 impl WorkerWebSocket {
@@ -308,14 +308,36 @@ impl WorkerWebSocket {
     }
 
     pub fn inbound(&self) -> WsPullSender {
-        self.inbound.clone()
+        self.inbound
+            .as_ref()
+            .expect("live Worker WebSocket has an inbound queue")
+            .clone()
+    }
+
+    /// Put a service-binding 101 back into the process handoff registry so a
+    /// caller Worker can pass the Response through to its own client without
+    /// materializing or proxying frames in JavaScript.
+    pub(super) fn repark(mut self) -> u64 {
+        let inbound = self
+            .inbound
+            .take()
+            .expect("live Worker WebSocket has an inbound queue");
+        let replaced = ws_registry()
+            .lock()
+            .unwrap()
+            .worker_handoffs
+            .insert(self.id, inbound);
+        drop(replaced);
+        self.id
     }
 }
 
 impl Drop for WorkerWebSocket {
     fn drop(&mut self) {
-        ws_pull_unregister(self.id);
-        ws_unregister(self.id);
+        if self.inbound.is_some() {
+            ws_pull_unregister(self.id);
+            ws_unregister(self.id);
+        }
     }
 }
 
@@ -338,7 +360,10 @@ pub(super) fn transfer_worker_websocket_handoff(id: u64) -> Option<WorkerWebSock
         .lock()
         .unwrap()
         .retain(|opened| *opened != id);
-    Some(WorkerWebSocket { id, inbound })
+    Some(WorkerWebSocket {
+        id,
+        inbound: Some(inbound),
+    })
 }
 
 /// Close every isolate-polled socket a finished request opened.

@@ -54,6 +54,9 @@ const SUPPORTED_KEYS: &[&str] = &[
     "r2_buckets",
     "worker_loaders",
     "no_bundle",
+    "build",
+    "rules",
+    "observability",
 ];
 
 /// The Durable Object class every D1 database runs as. It is supplied by the
@@ -283,6 +286,8 @@ struct Project {
     has_queues: bool,
     has_r2: bool,
     has_worker_loaders: bool,
+    /// Whether Wrangler Text rules declare `.txt` modules for esbuild to inline.
+    has_text_modules: bool,
 }
 
 struct ProjectAssets {
@@ -469,7 +474,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
                         wasm: Vec::new(),
                     })
             } else {
-                run_esbuild(&root, entry)
+                run_esbuild(&root, entry, project.has_text_modules)
             }
         })
         .transpose()?;
@@ -1006,6 +1011,14 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
              ASCII letters, digits, or internal hyphens: {script_name:?}"
         );
     }
+
+    // `build.command` is part of Wrangler's source-generation contract. Run it
+    // only after validating the project identity, but before inspecting `main`:
+    // Cloudflare OS uses it to generate the validated Worker entry point under
+    // `.wrangler/validate`.
+    run_build_command(object, root)?;
+    validate_observability(object)?;
+    let has_text_modules = read_text_rules(object)?;
     let main = object
         .get("main")
         .map(|value| {
@@ -1115,6 +1128,7 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
                 })
             })
             .transpose()?;
+        let props = service.get("props").cloned();
         let mut encoded = json!({
             "type": "service",
             "name": binding,
@@ -1122,6 +1136,9 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
         });
         if let Some(entrypoint) = entrypoint {
             encoded["entrypoint"] = json!(entrypoint);
+        }
+        if let Some(props) = props {
+            encoded["props"] = props;
         }
         bindings.push(encoded);
         service_count += 1;
@@ -1629,7 +1646,125 @@ fn read_project(path: &Path, root: &Path) -> anyhow::Result<Project> {
         queue_consumers,
         has_r2: !r2_buckets.is_empty(),
         has_worker_loaders: !worker_loaders.is_empty(),
+        has_text_modules,
     })
+}
+
+fn run_build_command(object: &Map<String, Value>, root: &Path) -> anyhow::Result<()> {
+    let Some(build) = object.get("build") else {
+        return Ok(());
+    };
+    let build = build
+        .as_object()
+        .ok_or_else(|| anyhow!("config `build` must be an object"))?;
+    let unsupported = build
+        .keys()
+        .filter(|key| !matches!(key.as_str(), "command" | "watch_dir"))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unsupported.is_empty() {
+        bail!(
+            "config `build` does not support these keys: {}",
+            unsupported.join(", ")
+        );
+    }
+    if let Some(watch_dir) = build.get("watch_dir") {
+        let valid = watch_dir.is_string()
+            || watch_dir
+                .as_array()
+                .is_some_and(|values| values.iter().all(Value::is_string));
+        if !valid {
+            bail!("config `build.watch_dir` must be a string or an array of strings");
+        }
+    }
+    let Some(command) = build.get("command") else {
+        return Ok(());
+    };
+    let command = command
+        .as_str()
+        .filter(|command| !command.trim().is_empty())
+        .ok_or_else(|| anyhow!("config `build.command` must be a non-empty string"))?;
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(root)
+        .output()
+        .with_context(|| format!("run Wrangler build command {command:?}"))?;
+    if !output.status.success() {
+        bail!(
+            "Wrangler build command failed ({command:?}):\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn validate_observability(object: &Map<String, Value>) -> anyhow::Result<()> {
+    if let Some(observability) = object.get("observability") {
+        if !observability.is_object() {
+            bail!("config `observability` must be an object");
+        }
+    }
+    Ok(())
+}
+
+fn read_text_rules(object: &Map<String, Value>) -> anyhow::Result<bool> {
+    let Some(rules) = object.get("rules") else {
+        return Ok(false);
+    };
+    let rules = rules
+        .as_array()
+        .ok_or_else(|| anyhow!("config `rules` must be an array"))?;
+    let mut text = false;
+    for (index, rule) in rules.iter().enumerate() {
+        let rule = rule
+            .as_object()
+            .ok_or_else(|| anyhow!("config `rules[{index}]` must be an object"))?;
+        let unsupported = rule
+            .keys()
+            .filter(|key| !matches!(key.as_str(), "type" | "globs" | "fallthrough"))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unsupported.is_empty() {
+            bail!(
+                "config `rules[{index}]` does not support these keys: {}",
+                unsupported.join(", ")
+            );
+        }
+        let kind = rule
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("config `rules[{index}].type` must be a string"))?;
+        if kind != "Text" {
+            bail!("config `rules[{index}]` type {kind:?} is not supported; celld currently supports only Wrangler Text rules");
+        }
+        if rule
+            .get("fallthrough")
+            .is_some_and(|value| value.as_bool() != Some(false))
+        {
+            bail!("config `rules[{index}].fallthrough` must be false when present");
+        }
+        let globs = rule
+            .get("globs")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("config `rules[{index}].globs` must be an array"))?;
+        if globs.is_empty() {
+            bail!("config `rules[{index}].globs` must not be empty");
+        }
+        for (glob_index, glob) in globs.iter().enumerate() {
+            let glob = glob.as_str().ok_or_else(|| {
+                anyhow!("config `rules[{index}].globs[{glob_index}]` must be a string")
+            })?;
+            if !matches!(glob, "**/*.txt" | "*.txt") {
+                bail!(
+                    "config `rules[{index}].globs[{glob_index}]` is {glob:?}; celld Text rules currently support only extension-wide *.txt globs"
+                );
+            }
+        }
+        text = true;
+    }
+    Ok(text)
 }
 
 fn reject_queue_keys(value: &Value, accepted: &[&str], kind: &str) -> anyhow::Result<()> {
@@ -2202,7 +2337,7 @@ struct BundleOutput {
     wasm: Vec<(String, Vec<u8>)>,
 }
 
-fn run_esbuild(root: &Path, entry: &str) -> anyhow::Result<BundleOutput> {
+fn run_esbuild(root: &Path, entry: &str, text_modules: bool) -> anyhow::Result<BundleOutput> {
     // node: builtins stay external. Wrangler polyfills them with unenv; celld
     // implements the workerd `nodejs_compat` subset itself, so the runtime
     // provides them.
@@ -2224,7 +2359,8 @@ fn run_esbuild(root: &Path, entry: &str) -> anyhow::Result<BundleOutput> {
   }
   return builtin;
 };"#;
-    let output = Command::new(&binary)
+    let mut command = Command::new(&binary);
+    command
         .current_dir(root)
         .arg(entry)
         .arg("--bundle")
@@ -2246,7 +2382,14 @@ fn run_esbuild(root: &Path, entry: &str) -> anyhow::Result<BundleOutput> {
         // the specifier to the copied file, so the bundle and the emitted
         // files agree on names; the runtime serves each file as a compiled
         // WebAssembly.Module default export.
-        .arg("--loader:.wasm=copy")
+        .arg("--loader:.wasm=copy");
+    if text_modules {
+        // Wrangler's Text rule imports the file as a JavaScript string. The
+        // accepted rule shape is extension-wide, so esbuild's extension loader
+        // is semantically equivalent and leaves no sibling module to deploy.
+        command.arg("--loader:.txt=text");
+    }
+    let output = command
         .arg(format!("--outdir={}", outdir.path().display()))
         .arg("--entry-names=index")
         .output()

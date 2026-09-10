@@ -1748,6 +1748,21 @@ impl RuntimeManager {
             .await
     }
 
+    /// Resolve the WorkerConfig that owns one exported DurableObject class in a
+    /// co-hosted service script. The caller's generation fences the lookup.
+    pub fn service_class_config(
+        &self,
+        generation: GenerationId,
+        script: &str,
+        class: &str,
+    ) -> anyhow::Result<Arc<WorkerConfig>> {
+        self.generation_by_id(generation)
+            .service_class_config(script, class)
+            .ok_or_else(|| {
+                anyhow!("service Worker {script} does not export Durable Object class {class}")
+            })
+    }
+
     /// Dispatch one broker-leased batch to its attached consumer script.
     pub async fn queue_service(
         &self,

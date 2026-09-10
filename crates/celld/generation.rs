@@ -260,7 +260,7 @@ fn dependencies_of(loaded: &LoadedDeployment) -> VecDeque<Dependency> {
     loaded
         .services
         .iter()
-        .map(|(_, script, _)| Dependency::Service(script.clone()))
+        .map(|binding| Dependency::Service(binding.service.clone()))
         .chain(queues.into_iter().map(Dependency::Queue))
         .collect()
 }
@@ -345,6 +345,15 @@ impl Generation {
 
     pub(crate) fn cell_config(&self, class: &str) -> Option<Arc<WorkerConfig>> {
         self.cell_configs.get(class).cloned()
+    }
+
+    /// Resolve a DurableObject class capability from a co-hosted service script.
+    /// Both parts are checked together so a class marker cannot retarget another
+    /// script in the same deployment graph.
+    #[doc(hidden)]
+    pub fn service_class_config(&self, script: &str, class: &str) -> Option<Arc<WorkerConfig>> {
+        let config = self.cell_configs.get(class)?;
+        (config.script_name() == script).then(|| config.clone())
     }
 
     /// The engine's reserved Durable Object classes this generation

@@ -596,14 +596,18 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
         if let (Some(name), Ok(url)) = (ai_binding, std::env::var("CELLD_AI_URL")) {
             lines.push_str(&format!("e[{:?}] = __makeAiBinding({:?});\n", name, url));
         }
-        for (binding, script, entrypoint) in services {
-            let entrypoint = match entrypoint {
+        for binding in services {
+            let entrypoint = match &binding.entrypoint {
                 Some(name) => format!("{name:?}"),
                 None => "null".to_string(),
             };
+            let props = match &binding.props {
+                Some(props) => serde_json::to_string(props)?,
+                None => "undefined".to_string(),
+            };
             lines.push_str(&format!(
-                "e[{:?}] = __makeServiceBinding({:?}, {});\n",
-                binding, script, entrypoint
+                "e[{:?}] = __makeServiceBinding({:?}, {}, {});\n",
+                binding.environment, binding.service, entrypoint, props
             ));
         }
         for (name, value) in vars {

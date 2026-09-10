@@ -281,6 +281,7 @@ globalThis.Response = class Response {
       this.headers.set("content-type", typed.type);
     this.webSocket = init.webSocket;
     this._wsTarget = init.__wsTarget || init._wsTarget || null;
+    this._workerSocketId = Number(init.__workerSocketId || init._workerSocketId || 0);
     this.ok = this.status >= 200 && this.status <= 299;
     this.redirected = false;
     this.type = "default";
@@ -358,7 +359,8 @@ globalThis.Response = class Response {
       this.body === null ? null : this._bodyBytes,
       {
         status: this.status, statusText: this.statusText, headers: this.headers,
-        webSocket: this.webSocket, __wsTarget: this._wsTarget, cf: this.cf,
+        webSocket: this.webSocket, __wsTarget: this._wsTarget,
+        __workerSocketId: this._workerSocketId, cf: this.cf,
       },
     );
     response.type = this.type;
@@ -2040,15 +2042,27 @@ const __blockLeave = (scope, block, event) => {
 };
 const __durableClassMeta = new WeakMap();
 let __nextFacetOwner = 1;
-const __makeDurableObjectClass = (idPromise, name, options = {}) => {
-  const value = {};
-  __durableClassMeta.set(value, {
-    idPromise,
+const __makeDurableObjectClass = (
+  idPromise, name, options = {}, transferId, sourceScript,
+) => {
+  // A DurableObjectClass is capability-like metadata, not plain cloneable data.
+  // Use a Proxy so structured clone enters the RPC lift path rather than silently
+  // erasing the WeakMap brand into `{}`.
+  const value = new Proxy({}, {});
+  const meta = {
+    idPromise: Promise.resolve(idPromise),
+    transferId,
+    sourceScript,
     name: name === null || name === undefined ? "default" : String(name),
     props: options?.props,
-  });
+  };
+  // Anonymous Worker Loader classes have no script identity; cache their local
+  // loader id once it resolves so same-process RPC can still transfer them.
+  meta.idPromise.then((id) => { meta.transferId = id; }, () => {});
+  __durableClassMeta.set(value, meta);
   return value;
 };
+const __facetMeta = new WeakMap();
 class DurableObjectFacets {
   constructor(state) {
     this._state = state;
@@ -2110,9 +2124,10 @@ class DurableObjectFacets {
         if (path.length !== 1)
           throw new Error(
             "Pipelined property paths on facets are not supported yet.");
+        if (path[0] === "__celld$internalRestore") throw __rpcNoSuchMethod(path[0]);
         return __rpcDes(await __facet_rpc(
           loader, className, this._state._scope, record.owner, name, id,
-          JSON.stringify(props ?? null), path[0], __rpcOut(args, false)));
+          JSON.stringify(props ?? null), path[0], __rpcOut(args, "bridge")));
       }),
     };
     // Arrow closures retain the manager because `target.fetch`'s method
@@ -2143,6 +2158,13 @@ class DurableObjectFacets {
         if (typeof prop !== "string") return undefined;
         return __makeNode(session, [prop], null);
       },
+    });
+    __facetMeta.set(record.stub, {
+      restore: (params) => invoke(async ([loader, className, id, props]) =>
+        __rpcDes(await __facet_rpc(
+          loader, className, this._state._scope, record.owner, name, id,
+          JSON.stringify(props ?? null), "__celld$internalRestore",
+          __rpcOut([params], "bridge")))),
     });
     this._running.set(name, record);
     return record.stub;
@@ -2216,6 +2238,18 @@ class DurableObjectState {
   // Workerd's DurableObjectState.exports (actor-state.h): the same
   // loopback surface as ctx.exports on stateless entrypoints.
   get exports() { return __ctxExports(); }
+  async restore(params) {
+    // Params are a durable recipe, not a live capability graph. Clone them now
+    // so a later storage round-trip cannot observe mutations and so an
+    // unsupported value fails at creation time, matching Workerd's contract.
+    const recipe = __sc_decode(__sc_encode(params));
+    const inst = __cell.instances[this._scope];
+    const fn = inst?.[__cf.restore];
+    if (typeof fn !== "function")
+      throw new TypeError("The current Durable Object does not implement [restore](params).");
+    const target = await fn.call(inst, recipe);
+    return __makePersistentRestoreStub(this._scope, recipe, target);
+  }
   blockConcurrencyWhile(f) {
     if (typeof f !== "function")
       throw new TypeError("blockConcurrencyWhile() requires a function");
@@ -2680,6 +2714,7 @@ const __wrapServiceResponse = (res, url) => {
       headers: res.headers,
       webSocket: res.webSocket || bound,
       __wsTarget: res._wsTarget,
+      __workerSocketId: res._workerSocketId,
     },
   );
   // The constructor copies headers, so mark the copy.
@@ -2721,6 +2756,7 @@ const __wrapServiceResponse = (res, url) => {
 // Worker Loader (Code Mode): spawn a fresh isolate from supplied code and
 // invoke it. Walking skeleton — only `load(code)` and a default-entrypoint
 // `fetch()` are wired, mirroring the cross-isolate service-binding path below.
+const __loaderEntrypointMeta = new WeakMap();
 globalThis.__makeLoader = () => {
   // `get(name, …)` is memoized by name to one isolate; `load()` is anonymous.
   // A stub holds a Promise<id> so `getCode` may be async and load lazily.
@@ -2750,20 +2786,27 @@ globalThis.__makeLoader = () => {
     // the loaded worker (default -> the "default" export, which
     // register_entrypoints registers like any other). fetch stays on the
     // target. Only single-method calls are supported for now.
+    const invoke = (path, args, selfRecipe, internalRestore = false) => (async () => {
+      if (path.length !== 1)
+        throw new Error(
+          "Pipelined property paths on loaded workers are not supported yet.");
+      const id = await idPromise;
+      const payload = {
+        "__celld$entrypointCall": true,
+        a: args,
+        l: true,
+        r: selfRecipe,
+        i: internalRestore ? "restore" : undefined,
+      };
+      return __rpcDes(
+        await __loader_rpc(id, entrypoint, path[0], __rpcOut(payload, "bridge")));
+    })();
     const session = {
       get: () => Promise.reject(new Error(
         "Awaitable properties on loaded workers are not supported yet.")),
-      call: (path, args) => (async () => {
-        if (path.length !== 1)
-          throw new Error(
-            "Pipelined property paths on loaded workers are not supported " +
-            "yet.");
-        const id = await idPromise;
-        return __rpcDes(
-          await __loader_rpc(id, entrypoint, path[0], __rpcOut(args, "bridge")));
-      })(),
+      call: (path, args) => invoke(path, args, undefined, false),
     };
-    return new Proxy(target, {
+    const stub = new Proxy(target, {
       get: (base, prop) => {
         if (prop === "then") return undefined;
         if (Reflect.has(base, prop)) return Reflect.get(base, prop);
@@ -2771,6 +2814,13 @@ globalThis.__makeLoader = () => {
         return __makeNode(session, [prop], null);
       },
     });
+    __loaderEntrypointMeta.set(stub, {
+      idPromise,
+      entrypoint,
+      invoke,
+      restore: (params) => invoke(["restore"], [params], undefined, true),
+    });
+    return stub;
   };
   // Anonymous load() workers are evicted when their only stub is GC'd: the
   // finalizer drops the worker's isolate so it does not leak. Named get()
@@ -2828,7 +2878,7 @@ globalThis.__makeLoader = () => {
     if (svc === undefined) return null;
     const marker = {
       "__celld$loaderSvc": svc.name,
-      s: __cell.script,
+      s: svc.script ?? __cell.script,
     };
     if (svc.props !== undefined) marker.p = svc.props;
     return marker;
@@ -2896,6 +2946,23 @@ globalThis.__reviveLoaderEnv = (env) => {
 globalThis.__makeServiceBinding = (
   script, entrypoint = null, props = undefined,
 ) => {
+  let localEntrypointInst;
+  const localMakeInst = script === __cell.script && entrypoint !== null &&
+      props !== undefined
+    ? () => {
+        if (localEntrypointInst !== undefined) return localEntrypointInst;
+        const cls = __cell.entrypoints[entrypoint];
+        if (typeof cls !== "function")
+          throw new TypeError("The entrypoint " + entrypoint + " cannot carry props.");
+        const ctx = __beginEvent(props);
+        try {
+          localEntrypointInst = new cls(ctx, __cell.env);
+        } finally {
+          __endEvent();
+        }
+        return localEntrypointInst;
+      }
+    : undefined;
   const target = {
   async fetch(input, init) {
     const req = new Request(input, init);
@@ -2979,6 +3046,7 @@ globalThis.__makeServiceBinding = (
     return __wrapServiceResponse(
       new Response(responseBody, {
         status: r.status, headers: r.headers, __wsTarget: r.wsTarget,
+        __workerSocketId: r.workerSocketId,
       }),
       req.url);
   },
@@ -3017,8 +3085,8 @@ globalThis.__makeServiceBinding = (
   // starts a fresh session, as in Workerd.
   const session =
     __entrypointSession(
-      entrypoint, script === __cell.script, script, undefined, props);
-  return new Proxy(target, {
+      entrypoint, script === __cell.script, script, localMakeInst, props);
+  const stub = new Proxy(target, {
     getPrototypeOf: () => __cf.ServiceStub.prototype,
     get: (base, prop) => {
     if (prop === "then") return undefined; // a stub is not a thenable
@@ -3030,6 +3098,8 @@ globalThis.__makeServiceBinding = (
       return (name) => __makeNode(session, [String(name)], null);
     return __makeNode(session, [prop], null);
   }});
+  __svcMeta.set(stub, { name: entrypoint, props, script });
+  return stub;
 };
 // RPC marshalling: V8 structured clone (Workerd js-rpc semantics), so
 // undefined, Date, Map, Set, BigInt, typed arrays, and cycles survive.
@@ -3301,6 +3371,7 @@ const __rpcBindMethod = (value, receiver) =>
   Reflect.apply(Function.prototype.bind, value, [receiver]);
 const __stubResolve = (target, prop) => {
   const rpcTarget = target instanceof __cf.RpcTarget;
+  const loaderEntrypoint = __loaderEntrypointMeta.has(target);
   if (rpcTarget) {
     // A Proxy may emulate RpcTarget by reporting RpcTarget.prototype from its
     // getPrototypeOf trap while synthesizing wildcard methods in its get trap.
@@ -3310,11 +3381,14 @@ const __stubResolve = (target, prop) => {
     const proxyTarget = __util_proxy_details(target) !== undefined;
     if (Object.hasOwn(target, prop) || prop in Object.prototype ||
         (!proxyTarget && !(prop in target))) throw __rpcNoSuchMethod(prop);
+  } else if (loaderEntrypoint) {
+    if (prop in Object.prototype) throw __rpcNoSuchMethod(prop);
   } else if (!Object.hasOwn(target, prop)) {
     throw __rpcNoSuchMethod(prop);
   }
   const value = target[prop];
-  if (rpcTarget && value === undefined) throw __rpcNoSuchMethod(prop);
+  if ((rpcTarget || loaderEntrypoint) && value === undefined)
+    throw __rpcNoSuchMethod(prop);
   // Keep celld's own stubs and pipeline nodes unwrapped because the wrapper
   // would lose their metadata.
   return typeof value === "function" && !__stubMeta.has(value) &&
@@ -3433,9 +3507,27 @@ const __stubLift = (value, bridge = false) => {
     const meta = __stubMeta.get(v);
     if (meta) {
       lifted = true;
-      caps = true;
       if (meta.disposed) throw __stubDisposedError();
-      // A stub belongs to the request that received it; another
+      // A persistent stub crosses by durable recipe rather than by a transient
+      // isolate/bridge handle. It therefore does not root the sender's context.
+      if (meta.entry.restore !== undefined) {
+        meta.disposed = true;
+        __ctxUnregister(meta);
+        let recipeBytes;
+        try {
+          recipeBytes = __sc_encode(meta.entry.restore);
+        } catch (error) {
+          throw new Error("persistent recipe encode failed: " + error);
+        }
+        const marker = {
+          "__celld$restoreRpc": recipeBytes,
+          c: meta.callable,
+        };
+        seen.set(v, marker);
+        return marker;
+      }
+      caps = true;
+      // A transient stub belongs to the request that received it; another
       // request cannot serialize it (Workerd's IoContext rule).
       if (meta.ctx !== ctx) throw __ctxError("Client");
       meta.disposed = true; // the ref moves to the receiver
@@ -3450,6 +3542,29 @@ const __stubLift = (value, bridge = false) => {
       seen.set(v, marker);
       return marker;
     }
+    const durableClass = __durableClassMeta.get(v);
+    if (durableClass !== undefined) {
+      lifted = true;
+      let marker;
+      if (durableClass.sourceScript !== undefined) {
+        marker = {
+          "__celld$doClassSvc": durableClass.sourceScript,
+          n: durableClass.name,
+        };
+      } else {
+        if (durableClass.transferId === undefined)
+          throw new DOMException(
+            "DurableObjectClass cannot cross RPC before its Worker Loader identity resolves.",
+            "DataCloneError");
+        marker = {
+          "__celld$doClass": durableClass.transferId,
+          n: durableClass.name,
+        };
+      }
+      seen.set(v, marker);
+      if (durableClass.props !== undefined) marker.p = lift(durableClass.props);
+      return marker;
+    }
     const svc = __svcMeta.get(v);
     if (svc !== undefined) {
       // A loopback service stub (ctx.exports): name + props cross
@@ -3458,7 +3573,7 @@ const __stubLift = (value, bridge = false) => {
       // nested channel tokens).
       lifted = true;
       caps = true;
-      const marker = { "__celld$svc": svc.name, t: __stubIsolate };
+      const marker = { "__celld$svc": svc.name, s: svc.script ?? __cell.script };
       seen.set(v, marker);
       if (svc.props !== undefined) marker.p = lift(svc.props);
       return marker;
@@ -3670,6 +3785,24 @@ const __stubRevive = (value) => {
   const seen = new Set();
   const revive = (v) => {
     if (v === null || typeof v !== "object") return v;
+    const restoreRecipe = v["__celld$restoreRpc"];
+    if (restoreRecipe !== undefined)
+      return __makeLazyPersistentRestoreRecipeStub(__sc_decode(restoreRecipe), v.c === true);
+    const serviceClassScript = v["__celld$doClassSvc"];
+    if (serviceClassScript !== undefined) {
+      const name = v.n === undefined ? "default" : String(v.n);
+      const props = revive(v.p);
+      return __makeDurableObjectClass(
+        __serviceClassLoader(String(serviceClassScript), name),
+        name, { props }, undefined, String(serviceClassScript));
+    }
+    const durableClassLoader = v["__celld$doClass"];
+    if (durableClassLoader !== undefined) {
+      const name = v.n === undefined ? "default" : String(v.n);
+      const props = revive(v.p);
+      return __makeDurableObjectClass(
+        Promise.resolve(Number(durableClassLoader)), name, { props }, Number(durableClassLoader));
+    }
     const bridgeId = v["__celld$bridge"];
     if (bridgeId !== undefined) {
       const entry = { bridge: bridgeId, refs: 1 };
@@ -3690,10 +3823,13 @@ const __stubRevive = (value) => {
       return stub;
     }
     const svcName = v["__celld$svc"];
-    if (svcName !== undefined)
+    if (svcName !== undefined) {
+      const props = revive(v.p);
+      if (typeof v.s === "string") return __makeServiceBinding(v.s, svcName, props);
       return v.t === __stubIsolate
-        ? __entrypointStub(svcName, revive(v.p))
+        ? __entrypointStub(svcName, props)
         : __foreignStub();
+    }
     const doClass = v["__celld$do"];
     if (doClass !== undefined) {
       const namespace = __cell.makeNamespace(doClass);
@@ -3833,6 +3969,12 @@ const __stubOp = (meta, path, args) => {
     return (async () => __rpcDes(await __rpc_bridge_call(
       entry.bridge, JSON.stringify(path), argsSc)))();
   }
+  if (entry.restore !== undefined && entry.target === undefined) {
+    return (async () => {
+      entry.target = await __resolvePersistentRestoreTarget(entry);
+      return __stubOp(meta, path, args);
+    })();
+  }
   // The cell that minted this stub left residency, so `entry.target`
   // belongs to an instance this node released. The stub fails here
   // rather than calling into it.
@@ -3871,6 +4013,11 @@ const __stubOp = (meta, path, args) => {
         const decoded =
           argsSc === null ? null : __rpcDesArgs(argsSc);
         try {
+          const loader = __loaderEntrypointMeta.get(entry.target);
+          if (loader !== undefined && entry.restore !== undefined) {
+            return await loader.invoke(
+              path, decoded === null ? null : decoded.args, entry.restore, false);
+          }
           return await __rpcWalk(entry.target, path,
             decoded === null ? null : decoded.args, false);
         } finally {
@@ -3983,7 +4130,7 @@ const __entrypointSession = (
     const wireArgs = !local && remoteProps !== undefined
       ? { "__celld$entrypointCall": true, p: remoteProps, a: args }
       : args;
-    const argsSc = __rpcOut(wireArgs, local);
+    const argsSc = __rpcOut(wireArgs, local ? true : "bridge");
     if (local)
       return __rpcDes(await __entrypointOp(
         name, path, argsSc, true, makeInst));
@@ -4006,17 +4153,48 @@ const __entrypointSession = (
 // MAX_PROPERTY_DEPTH.
 const __makeNode = (session, path, ctx) => {
   let promise;
-  const value = () => promise ??= (() => {
-    if (path.length === 0) return session.root();
-    if (ctx !== null && ctx !== __ctxNow())
-      return Promise.reject(__ctxError("Pipeline"));
-    return session.get(path);
-  })();
+  let settled = false;
+  let resolvedValue;
+  let disposed = false;
+  const value = () => {
+    if (disposed) return Promise.reject(new Error("RPC promise used after being disposed."));
+    if (promise !== undefined) return promise;
+    const started = (() => {
+      if (path.length === 0) return session.root();
+      if (ctx !== null && ctx !== __ctxNow())
+        return Promise.reject(__ctxError("Pipeline"));
+      return session.get(path);
+    })();
+    promise = Promise.resolve(started).then((resolved) => {
+      settled = true;
+      resolvedValue = resolved;
+      return resolved;
+    }, (error) => {
+      settled = true;
+      throw error;
+    });
+    return promise;
+  };
+  const disposeResolved = (resolved) => {
+    if (resolved === null || resolved === undefined) return;
+    const disposer = resolved[Symbol.dispose];
+    if (typeof disposer === "function") disposer.call(resolved);
+  };
+  const dispose = () => {
+    if (disposed) return;
+    disposed = true;
+    if (settled) {
+      disposeResolved(resolvedValue);
+    } else if (promise !== undefined) {
+      promise.then(disposeResolved, () => {});
+    }
+  };
   const brand =
     path.length === 0 ? __cf.RpcPromise : __cf.RpcProperty;
   return new Proxy(function () {}, {
     getPrototypeOf: () => brand.prototype,
     get: (_b, p) => {
+      if (p === Symbol.dispose) return dispose;
       if (p === "then")
         return (onOk, onErr) => value().then(onOk, onErr);
       if (p === "catch") return (onErr) => value().catch(onErr);
@@ -4030,7 +4208,10 @@ const __makeNode = (session, path, ctx) => {
     },
     apply: (_b, _this, args) => {
       let call;
-      if (ctx !== null && ctx !== __ctxNow()) {
+      if (disposed) {
+        call = Promise.reject(new Error("RPC promise used after being disposed."));
+        call.catch(() => {});
+      } else if (ctx !== null && ctx !== __ctxNow()) {
         call = Promise.reject(__ctxError("JsRpcPromise"));
         call.catch(() => {});
       } else {
@@ -4064,6 +4245,90 @@ const __makeStub = (entry, callable) => {
   });
   __stubMeta.set(stub, meta);
   return stub;
+};
+
+const __restoreRecipeClone = (value) => __sc_decode(__sc_encode(value));
+const __makePersistentRestoreRecipeStub = (recipe, target) => {
+  let entry;
+  let callable = typeof target === "function";
+  const existing = __stubMeta.get(target);
+  if (existing !== undefined) {
+    if (existing.disposed) throw __stubDisposedError();
+    // Move the live handle into the persistent wrapper. The entry keeps the
+    // same reference count; only the request-owned wrapper changes.
+    existing.disposed = true;
+    __ctxUnregister(existing);
+    entry = existing.entry;
+    callable = existing.callable;
+  } else {
+    if (!(target instanceof __cf.RpcTarget) && typeof target !== "function" &&
+        !__loaderEntrypointMeta.has(target))
+      throw new TypeError("[restore](params) must return an RpcTarget, RpcStub, Loader entrypoint, or function.");
+    entry = __newEntry(target);
+  }
+  entry.restore = recipe;
+  return __makeStub(entry, callable);
+};
+const __makePersistentRestoreStub = (scope, params, target) =>
+  __makePersistentRestoreRecipeStub({ scope, params }, target);
+
+const __makeLazyPersistentRestoreRecipeStub = (recipe, callable = false) => {
+  const entry = __newEntry(undefined);
+  entry.restore = recipe;
+  return __makeStub(entry, callable);
+};
+const __makeLazyPersistentRestoreStub = (scope, params) =>
+  __makeLazyPersistentRestoreRecipeStub({ scope, params });
+
+const __invokeRestoreOnTarget = async (target, params) => {
+  const cloned = __restoreRecipeClone(params);
+  const loader = __loaderEntrypointMeta.get(target);
+  if (loader !== undefined) return loader.restore(cloned);
+  const facet = __facetMeta.get(target);
+  if (facet !== undefined) return facet.restore(cloned);
+  const fn = target?.[__cf.restore];
+  if (typeof fn === "function") return fn.call(target, cloned);
+  throw new TypeError("The restored RPC target does not implement [restore](params).");
+};
+const __resolveRestoreRecipe = async (recipe) => {
+  if (recipe?.parent !== undefined) {
+    const parent = await __resolveRestoreRecipe(recipe.parent);
+    return __invokeRestoreOnTarget(parent, recipe.params);
+  }
+  const inst = __cell.instances[recipe.scope] ?? _instance(recipe.scope);
+  const fn = inst?.[__cf.restore];
+  if (typeof fn !== "function")
+    throw new TypeError("The restored Durable Object no longer implements [restore](params).");
+  return fn.call(inst, __restoreRecipeClone(recipe.params));
+};
+const __resolvePersistentRestoreTarget = async (entry) => {
+  if (entry.bridge !== undefined || entry.target !== undefined) return entry.target;
+  const target = await __resolveRestoreRecipe(entry.restore);
+  const restoredMeta = __stubMeta.get(target);
+  if (restoredMeta !== undefined) {
+    if (restoredMeta.disposed) throw __stubDisposedError();
+    // Move the restored stub's live transport into the persistent wrapper. The
+    // wrapper keeps its own durable recipe, so a later restart can resolve it
+    // again instead of depending on this live handle.
+    restoredMeta.disposed = true;
+    __ctxUnregister(restoredMeta);
+    const restoredEntry = restoredMeta.entry;
+    if (restoredEntry.bridge !== undefined) {
+      entry.bridge = restoredEntry.bridge;
+      entry.target = undefined;
+    } else {
+      entry.target = restoredEntry.target;
+      entry.ctx = restoredEntry.ctx;
+      entry.scope = restoredEntry.scope;
+      entry.section = restoredEntry.section;
+    }
+    return entry.target;
+  }
+  if (!(target instanceof __cf.RpcTarget) && typeof target !== "function" &&
+      !__loaderEntrypointMeta.has(target))
+    throw new TypeError("[restore](params) must return an RpcTarget, RpcStub, Loader entrypoint, or function.");
+  entry.target = target;
+  return target;
 };
 // A loopback service stub for one of this worker's own
 // entrypoints — the ctx.exports surface. Calling the stub itself
@@ -4101,7 +4366,7 @@ const __entrypointStub = (name, props) => {
     apply: (_b, _this, args) =>
       __entrypointStub(name, args[0]?.props),
   });
-  __svcMeta.set(stub, { name, props });
+  __svcMeta.set(stub, { name, props, script: __cell.script });
   return stub;
 };
 // ---- stored stubs ----------------------------------------------
@@ -4130,17 +4395,49 @@ const __storedLift = (value) => {
     // side tables and brands before touching any property — a
     // stub or pipeline proxy answers every property read with a
     // fresh RpcProperty node.
-    if (__stubMeta.has(v) || v instanceof __cf.RpcTarget)
+    const stubMeta = __stubMeta.get(v);
+    if (stubMeta !== undefined) {
+      if (stubMeta.disposed) throw __stubDisposedError();
+      const recipe = stubMeta.entry.restore;
+      if (recipe !== undefined) {
+        lifted = true;
+        const marker = recipe.parent === undefined
+          ? { "__celld$restore": recipe.scope, p: lift(recipe.params) }
+          : { "__celld$restoreRecipe": __sc_encode(recipe) };
+        seen.set(v, marker);
+        return marker;
+      }
       throw new DOMException(
-        "Durable Object storage can only store stubs with " +
-        "durable identity: service stubs from ctx.exports and " +
-        "Durable Object stubs. This value is a transient RPC " +
-        "handle that would not survive a restart.",
-        "DataCloneError");
+        "Durable Object storage can only store stubs with durable identity: " +
+        "service stubs from ctx.exports, Durable Object stubs, and stubs " +
+        "created by ctx.restore(). This value is a transient RPC handle that " +
+        "would not survive a restart.", "DataCloneError");
+    }
+    const durableClass = __durableClassMeta.get(v);
+    if (durableClass !== undefined) {
+      if (durableClass.sourceScript === undefined)
+        throw new DOMException(
+          "Durable Object storage can only store DurableObjectClass values with a stable Worker script identity.",
+          "DataCloneError");
+      lifted = true;
+      const marker = {
+        "__celld$doClassSvc": durableClass.sourceScript,
+        n: durableClass.name,
+      };
+      seen.set(v, marker);
+      if (durableClass.props !== undefined) marker.p = lift(durableClass.props);
+      return marker;
+    }
+    if (v instanceof __cf.RpcTarget)
+      throw new DOMException(
+        "Durable Object storage can only store stubs with durable identity: " +
+        "service stubs from ctx.exports, Durable Object stubs, and stubs " +
+        "created by ctx.restore(). This value is a transient RPC target that " +
+        "would not survive a restart.", "DataCloneError");
     const svc = __svcMeta.get(v);
     if (svc !== undefined) {
       lifted = true;
-      const marker = { "__celld$svc": svc.name };
+      const marker = { "__celld$svc": svc.name, s: svc.script ?? __cell.script };
       seen.set(v, marker);
       if (svc.props !== undefined) marker.p = lift(svc.props);
       return marker;
@@ -4190,9 +4487,27 @@ const __storedRevive = (value) => {
   const seen = new Set();
   const revive = (v) => {
     if (v === null || typeof v !== "object") return v;
+    const restoreRecipe = v["__celld$restoreRecipe"];
+    if (restoreRecipe !== undefined)
+      return __makeLazyPersistentRestoreRecipeStub(__sc_decode(restoreRecipe));
+    const restoreScope = v["__celld$restore"];
+    if (restoreScope !== undefined)
+      return __makeLazyPersistentRestoreStub(restoreScope, revive(v.p));
     const svcName = v["__celld$svc"];
-    if (svcName !== undefined)
-      return __entrypointStub(svcName, revive(v.p));
+    if (svcName !== undefined) {
+      const props = revive(v.p);
+      return typeof v.s === "string"
+        ? __makeServiceBinding(v.s, svcName, props)
+        : __entrypointStub(svcName, props);
+    }
+    const serviceClassScript = v["__celld$doClassSvc"];
+    if (serviceClassScript !== undefined) {
+      const name = v.n === undefined ? "default" : String(v.n);
+      const props = revive(v.p);
+      return __makeDurableObjectClass(
+        __serviceClassLoader(String(serviceClassScript), name),
+        name, { props }, undefined, String(serviceClassScript));
+    }
     const doClass = v["__celld$do"];
     if (doClass !== undefined)
       return __cell.makeNamespace(doClass).get(
@@ -4228,11 +4543,23 @@ const __unwrapStoredMap = (v) => {
 // for ctx.facets.get(); env bindings remain DurableObjectNamespace objects.
 let __ctxExportsCache;
 let __selfLoaderId;
+const __serviceClassLoaderCache = new Map();
+const __serviceClassLoader = (script, name) => {
+  const key = script + "\u0000" + name;
+  let loader = __serviceClassLoaderCache.get(key);
+  if (loader === undefined) {
+    loader = Promise.resolve(__service_class_loader(script, name)).then(Number);
+    __serviceClassLoaderCache.set(key, loader);
+  }
+  return loader;
+};
 const __selfDurableObjectClass = (name) => {
   const namespace = () => __cell.makeNamespace(name);
-  const cls = (options = {}) =>
-    __makeDurableObjectClass(
-      Promise.resolve(__selfLoaderId ??= __loader_self()), name, options);
+  const cls = (options = {}) => {
+    const loader = __selfLoaderId ??= __loader_self();
+    return __makeDurableObjectClass(
+      Promise.resolve(loader), name, options, loader, __cell.script);
+  };
   for (const method of [
     "idFromName", "idFromString", "newUniqueId", "jurisdiction", "getByName", "get",
   ]) {
@@ -4680,6 +5007,8 @@ globalThis.__dispatchRpc = async (scope, method, args) => {
     // A string is the legacy JSON flavor; bytes are V8 structured clone.
     // Answer in kind.
     if (typeof args === "string") {
+      if (method === "__celld$internalRestore")
+        throw new TypeError("Internal restore is unavailable over legacy RPC.");
       const [inst, fn] = await __rpcTargetMethod(scope, method);
       const result = await fn.apply(inst, JSON.parse(args));
       return JSON.stringify(result) ?? "null";
@@ -4693,6 +5022,17 @@ globalThis.__dispatchRpc = async (scope, method, args) => {
           if (__brokenActors.size !== 0) {
             const broken = __brokenActors.get(scope);
             if (broken !== undefined) throw broken;
+          }
+          if (method === "__celld$internalRestore") {
+            if (!Array.isArray(decoded.args) || decoded.args.length !== 1)
+              throw new TypeError("internal restore requires exactly one params argument");
+            const inst = await _readyInstance(scope);
+            if (!inst.__celldState._rpcOk)
+              throw new TypeError("The receiving Durable Object does not support RPC.");
+            const fn = inst[__cf.restore];
+            if (typeof fn !== "function")
+              throw new TypeError("The Durable Object does not implement [restore](params).");
+            return fn.call(inst, __restoreRecipeClone(decoded.args[0]));
           }
           const [inst, fn] = await __rpcTargetMethod(scope, method);
           return fn.apply(inst, decoded.args);
@@ -4931,26 +5271,46 @@ const __entrypointOp = (name, path, argsSc, local, makeInst) => {
   const decoded = argsSc === null ? null : __rpcDesArgs(argsSc);
   const tailTrace = __tailBegin(id, path[0] ?? "");
   let scopedInst;
+  let selfRecipe;
+  let internalRestore = false;
+  let loaderCall = false;
   if (makeInst === undefined && decoded !== null &&
       decoded.args !== null && !Array.isArray(decoded.args) &&
       decoded.args["__celld$entrypointCall"] === true &&
       Array.isArray(decoded.args.a)) {
-    const props = decoded.args.p;
-    decoded.args = decoded.args.a;
-    makeInst = () => {
-      if (scopedInst !== undefined) return scopedInst;
-      const cls = __cell.entrypoints[name];
-      if (typeof cls !== "function")
-        throw new TypeError(
-          "The entrypoint " + name + " cannot carry props.");
-      const ctx = __beginEvent(props);
-      try {
-        scopedInst = new cls(ctx, __cell.env);
-      } finally {
-        __endEvent();
-      }
-      return scopedInst;
-    };
+    const envelope = decoded.args;
+    const props = envelope.p;
+    selfRecipe = envelope.r;
+    internalRestore = envelope.i === "restore";
+    loaderCall = envelope.l === true;
+    decoded.args = envelope.a;
+    if (props !== undefined || selfRecipe !== undefined || internalRestore) {
+      makeInst = () => {
+        if (scopedInst !== undefined) return scopedInst;
+        const cls = __cell.entrypoints[name];
+        if (typeof cls !== "function")
+          throw new TypeError(
+            "The entrypoint " + name + " cannot carry persistent self identity.");
+        const restoreFn = selfRecipe === undefined ? undefined : async (params) => {
+          const inner = __restoreRecipeClone(params);
+          const fn = scopedInst?.[__cf.restore];
+          if (typeof fn !== "function")
+            throw new TypeError("The current WorkerEntrypoint does not implement [restore](params).");
+          const target = await fn.call(scopedInst, inner);
+          return __makePersistentRestoreRecipeStub({
+            parent: __restoreRecipeClone(selfRecipe),
+            params: inner,
+          }, target);
+        };
+        const ctx = __beginEvent(props, restoreFn);
+        try {
+          scopedInst = new cls(ctx, __cell.env);
+        } finally {
+          __endEvent();
+        }
+        return scopedInst;
+      };
+    }
   }
   let drain = null;
   try {
@@ -4975,8 +5335,17 @@ const __entrypointOp = (name, path, argsSc, local, makeInst) => {
         } else {
           const inst = makeInst === undefined
             ? __entrypointInstance(name) : makeInst();
-          result = __rpcWalk(inst, path,
-            decoded === null ? null : decoded.args, true);
+          if (internalRestore) {
+            if (decoded === null || !Array.isArray(decoded.args) || decoded.args.length !== 1)
+              throw new TypeError("internal restore requires exactly one params argument");
+            const fn = inst?.[__cf.restore];
+            if (typeof fn !== "function")
+              throw new TypeError("The WorkerEntrypoint does not implement [restore](params).");
+            result = fn.call(inst, __restoreRecipeClone(decoded.args[0]));
+          } else {
+            result = __rpcWalk(inst, path,
+              decoded === null ? null : decoded.args, true);
+          }
         }
       } finally {
         drain = __endEvent();
@@ -4987,7 +5356,7 @@ const __entrypointOp = (name, path, argsSc, local, makeInst) => {
         __tailException(tailTrace, error);
         throw error;
       }
-    }, local);
+    }, loaderCall || internalRestore || !local ? "bridge" : true);
     // Registered work drains before a plain reply. A
     // capability-bearing reply (tag 1) must not wait: a returned
     // stream's chunks may be produced by that very work, which
@@ -9587,6 +9956,7 @@ globalThis.__cf = {
       });
     }
   },
+  restore: Symbol("cloudflare:workers:restore"),
   // Named entrypoint for `[[services]]` with `entrypoint = "Name"`.
   WorkerEntrypoint: class WorkerEntrypoint {
     constructor(ctx, env) { this.ctx = ctx; this.env = env; }
@@ -11095,16 +11465,21 @@ globalThis.__registerWaitUntil = (promise) => {
 // `props` are the per-stub props a loopback service stub carries
 // (ctx.props); `exports` is built once, on first access.
 const __defaultProps = {};
-const __entrypointContext = (props = __defaultProps) => ({
-  waitUntil: globalThis.__registerWaitUntil,
-  passThroughOnException() {},
-  abort: __ctxAbortCurrent,
-  props,
-  get exports() { return __ctxExports(); },
-});
-globalThis.__beginEvent = (props = __defaultProps) => {
+const __entrypointContext = (props = __defaultProps, restoreFn) => {
+  const ctx = {
+    waitUntil: globalThis.__registerWaitUntil,
+    passThroughOnException() {},
+    abort: __ctxAbortCurrent,
+    props,
+    get exports() { return __ctxExports(); },
+  };
+  if (restoreFn !== undefined)
+    Object.defineProperty(ctx, "restore", { value: restoreFn });
+  return ctx;
+};
+globalThis.__beginEvent = (props = __defaultProps, restoreFn) => {
   __event_begin();
-  return __entrypointContext(props);
+  return __entrypointContext(props, restoreFn);
 };
 globalThis.__endEvent = () => __event_end();
 // Workerd's writable filesystem is memory-backed and request-scoped. The
@@ -11489,9 +11864,9 @@ globalThis.__readResponse = (r) => {
   // only a generic invalid status instead of the Worker contract failure.
   if (r.type === "error" || r.status === 0)
     return { error: __ERROR_RESPONSE_MESSAGE };
-  let workerSocketId = 0;
+  let workerSocketId = Number(r._workerSocketId || 0);
   let wsTarget = r._wsTarget || (r.webSocket && r.webSocket._target) || null;
-  if (r.status === 101 && r.webSocket && wsTarget === null) {
+  if (workerSocketId === 0 && r.status === 101 && r.webSocket && wsTarget === null) {
     const server = r.webSocket._peer;
     if (server && server._accepted) {
       workerSocketId = server._id;

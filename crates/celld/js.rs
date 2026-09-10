@@ -334,6 +334,18 @@ pub struct SvcRpcReq {
 }
 static SVC_RPC_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<SvcRpcReq>> = OnceLock::new();
 
+/// Resolve a DurableObjectClass capability received from another co-hosted
+/// Worker into a loader owned by the receiving isolate.
+pub struct ServiceClassLoaderReq {
+    pub generation: crate::generation::GenerationId,
+    pub script: String,
+    pub class_name: String,
+    pub reply: tokio::sync::oneshot::Sender<Result<Arc<WorkerConfig>>>,
+}
+static SERVICE_CLASS_LOADER_TX: OnceLock<
+    tokio::sync::mpsc::UnboundedSender<ServiceClassLoaderReq>,
+> = OnceLock::new();
+
 /// The persisted identity a consumer settlement must match for one message.
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct QueueLeaseRef {
@@ -374,6 +386,10 @@ fn kv_blob_store() -> std::result::Result<&'static crate::bucket::Bucket, String
 
 pub fn set_svc_rpc_tx(tx: tokio::sync::mpsc::UnboundedSender<SvcRpcReq>) {
     let _ = SVC_RPC_TX.set(tx);
+}
+
+pub fn set_service_class_loader_tx(tx: tokio::sync::mpsc::UnboundedSender<ServiceClassLoaderReq>) {
+    let _ = SERVICE_CLASS_LOADER_TX.set(tx);
 }
 pub fn set_svc_call_tx(tx: tokio::sync::mpsc::UnboundedSender<SvcCallReq>) {
     let _ = SVC_CALL_TX.set(tx);
@@ -2628,11 +2644,22 @@ fn encode_http_response(
         "headers": response.headers,
     });
     if ws_target {
-        let target = match response.websocket.as_ref() {
-            Some(HttpResponseWebSocket::Cell(target)) => Some(target),
-            _ => None,
-        };
-        obj["wsTarget"] = serde_json::json!(target);
+        match response.websocket.take() {
+            Some(HttpResponseWebSocket::Cell(target)) => {
+                obj["wsTarget"] = serde_json::json!(target);
+            }
+            Some(HttpResponseWebSocket::Worker(worker)) => {
+                // A service-binding 101 from a stateless Worker stays entirely
+                // process-local. Put its frame channel back in the handoff
+                // registry and send only the opaque id through the caller
+                // isolate; if that caller returns the Response, __readResponse
+                // transfers the exact same socket to the external client.
+                obj["workerSocketId"] = serde_json::json!(worker.repark());
+            }
+            None => {
+                obj["wsTarget"] = serde_json::Value::Null;
+            }
+        }
     }
     if let Some(stream) = response.stream.take() {
         let Some(stream_id) = stream_service.register_source(HttpStreamSource::Stream(stream))
@@ -3942,6 +3969,16 @@ pub struct QueueBinding {
     pub delivery_delay: u32,
 }
 
+/// One service binding in a Worker environment. `props` are the per-binding
+/// WorkerEntrypoint props from Wrangler's services[].props.
+#[derive(Clone)]
+pub struct ServiceBinding {
+    pub environment: String,
+    pub service: String,
+    pub entrypoint: Option<String>,
+    pub props: Option<serde_json::Value>,
+}
+
 /// One queue's push consumer after the owning script has been resolved.
 #[derive(Clone)]
 pub struct QueueConsumerRegistration {
@@ -3985,9 +4022,9 @@ pub struct WorkerConfig {
     /// The worker's non-main modules, so the main module can import siblings.
     modules: Vec<(String, ModuleSource)>,
     compat: Compat,
-    /// `[[services]]`: (binding name, target script, optional entrypoint).
+    /// `[[services]]`: binding name, target script, optional entrypoint and props.
     /// The target runs in this process; see [[service-bindings]].
-    services: Vec<(String, String, Option<String>)>,
+    services: Vec<ServiceBinding>,
     asset_binding: Option<String>,
     /// `env` names of Worker Loader bindings this Worker may use to spawn
     /// dynamic isolates.
@@ -4141,6 +4178,10 @@ impl WorkerConfig {
             .map(|((name, source), imports)| (name, source, imports))
     }
 
+    pub(crate) fn script_name(&self) -> &str {
+        &self.script_name
+    }
+
     /// Give this Worker the deployment's cron trigger expressions.
     pub fn with_crons(mut self, crons: Vec<String>) -> Self {
         self.crons = crons;
@@ -4177,7 +4218,7 @@ impl WorkerConfig {
     }
 
     /// Declare the service bindings this Worker may call.
-    pub fn with_services(mut self, services: Vec<(String, String, Option<String>)>) -> Self {
+    pub fn with_services(mut self, services: Vec<ServiceBinding>) -> Self {
         self.services = services;
         self
     }
@@ -7754,6 +7795,7 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
         "__alarm_get" => op_alarm_get,
         "__alarm_delete" => op_alarm_delete,
         "__loader_self" => op_loader_self,
+        "__service_class_loader" => op_service_class_loader,
         "__loader_load" => op_loader_load,
         "__loader_fetch" => op_loader_fetch,
         "__loader_rpc" => op_loader_rpc,
@@ -8692,6 +8734,68 @@ fn op_loader_self(
         loaded.send_replace(state);
     });
     rv.set(v8::Number::new(scope, id as f64).into());
+}
+
+/// Resolve an exported DurableObjectClass from a co-hosted service script into
+/// a loader owned by the receiving isolate. The wire identity is script+class;
+/// the loader id is minted locally for this generation and never crosses nodes.
+fn op_service_class_loader(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let script = args.get(0).to_rust_string_lossy(scope);
+    let class_name = args.get(1).to_rust_string_lossy(scope);
+    let owner = *scope
+        .get_slot::<LoaderOwner>()
+        .expect("Worker isolate has a Loader owner");
+    let generation = current_generation(scope);
+    let max = crate::env_vars::positive_or("CELLD_MAX_LOADED_WORKERS", 256)
+        .expect("validated CELLD_MAX_LOADED_WORKERS");
+    let (reply, receive) = tokio::sync::oneshot::channel();
+    let request = ServiceClassLoaderReq {
+        generation,
+        script,
+        class_name,
+        reply,
+    };
+    let async_id = asyncrt::enqueue(async move {
+        let sender = SERVICE_CLASS_LOADER_TX
+            .get()
+            .ok_or_else(|| "no service class loader channel".to_string())?;
+        sender
+            .send(request)
+            .map_err(|_| "service class loader channel closed".to_string())?;
+        let config = match receive.await {
+            Ok(Ok(config)) => config,
+            Ok(Err(error)) => return Err(format!("{error}")),
+            Err(error) => return Err(format!("service class loader dropped: {error}")),
+        };
+        if loader_registry().lock().unwrap().len() >= max {
+            return Err(format!(
+                "worker loader: too many loaded workers (limit {max})"
+            ));
+        }
+        let id = LOADER_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let (loaded, state) = tokio::sync::watch::channel(LoaderState::Loading);
+        loader_registry()
+            .lock()
+            .unwrap()
+            .insert(id, LoaderEntry { owner, state });
+        tokio::spawn(async move {
+            let state = match tokio::task::spawn_blocking(move || Worker::load_config(config)).await
+            {
+                Ok(Ok(worker)) => LoaderState::Ready(crate::pool::Slot::standalone(worker)),
+                Ok(Err(error)) => LoaderState::Failed(Arc::from(format!("{error}"))),
+                Err(error) => LoaderState::Failed(Arc::from(format!(
+                    "worker loader: load task failed: {error}"
+                ))),
+            };
+            loaded.send_replace(state);
+        });
+        Ok(id.to_string())
+    });
+    rv.set(promise_for(scope, async_id));
 }
 
 /// `__loader_load(codeJson)` -> stub id. Builds a WorkerConfig from the

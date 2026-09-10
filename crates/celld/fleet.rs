@@ -937,7 +937,7 @@ pub struct LoadedDeployment {
     pub prefix: String,
     pub asset_binding: Option<String>,
     pub assets: Option<crate::assets::AssetResolver>,
-    pub services: Vec<(String, String, Option<String>)>,
+    pub services: Vec<crate::js::ServiceBinding>,
     pub loader_bindings: Vec<String>,
     /// `triggers.crons` from the manifest, driving the reserved cron cell.
     pub crons: Vec<String>,
@@ -958,17 +958,18 @@ fn bindings<'a>(
         })
 }
 
-fn service_bindings(manifest: &Manifest) -> Vec<(String, String, Option<String>)> {
+fn service_bindings(manifest: &Manifest) -> Vec<crate::js::ServiceBinding> {
     bindings(manifest, "service")
         .filter_map(|binding| {
-            Some((
-                binding.get("name")?.as_str()?.to_string(),
-                binding.get("service")?.as_str()?.to_string(),
-                binding
+            Some(crate::js::ServiceBinding {
+                environment: binding.get("name")?.as_str()?.to_string(),
+                service: binding.get("service")?.as_str()?.to_string(),
+                entrypoint: binding
                     .get("entrypoint")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string),
-            ))
+                props: binding.get("props").cloned(),
+            })
         })
         .collect()
 }
