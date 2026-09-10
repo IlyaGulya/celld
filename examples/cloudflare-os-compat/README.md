@@ -75,6 +75,20 @@ AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
 
 The HA test starts two production-mode nodes, creates durable state on node A, invokes a returned transient `RpcTarget` through node B, then SIGKILLs A. One request to B must wait for ownership turnover and return the same acknowledged durable state without a client-side retry loop. Use only a disposable bucket prefix: the script deploys its fixture there.
 
+### Mixed peer-protocol replacement
+
+When a celld change bumps the authenticated peer protocol, exercise the fail-closed rolling replacement with an old and a new binary:
+
+```sh
+CELLD_UPGRADE_BUCKET=s3://my-test-bucket/cloudflare-os-upgrade \
+CELLD_UPGRADE_ENDPOINT=http://127.0.0.1:9000 \
+AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
+  bash examples/cloudflare-os-compat/upgrade-test.sh \
+    /path/to/old-celld ./target/debug/celld
+```
+
+The old binary publishes a plain Durable Object fixture and becomes its owner. The new node must explicitly refuse the incompatible owner rather than attempt peer RPC, then recover the latest bucket-acknowledged value after the old owner's lease expires. Finally, the replaced slot rejoins on the new binary and both nodes must read the same value. Use a dedicated disposable bucket prefix.
+
 ## TDD rule
 
 Do not weaken these tests to make the suite green. In particular, do not replace either capability with an HTTP endpoint/token. The desired result is compatibility with the Cloudflare runtime model used by Cloudflare OS.
