@@ -2043,14 +2043,18 @@ const __blockLeave = (scope, block, event) => {
 const __durableClassMeta = new WeakMap();
 let __nextFacetOwner = 1;
 const __makeDurableObjectClass = (
-  idPromise, name, options = {}, transferId, sourceScript,
+  idSource, name, options = {}, transferId, sourceScript,
 ) => {
   // A DurableObjectClass is capability-like metadata, not plain cloneable data.
   // Use a Proxy so structured clone enters the RPC lift path rather than silently
-  // erasing the WeakMap brand into `{}`.
+  // erasing the WeakMap brand into `{}`. A service-backed class may cross several
+  // RPC hops before anybody instantiates it as a facet, so its local loader is
+  // deliberately lazy: the stable wire identity is script + class + props.
   const value = new Proxy({}, {});
+  const lazyFactory = typeof idSource === "function" ? idSource : undefined;
   const meta = {
-    idPromise: Promise.resolve(idPromise),
+    idPromise: lazyFactory === undefined ? Promise.resolve(idSource) : undefined,
+    idFactory: lazyFactory,
     transferId,
     sourceScript,
     name: name === null || name === undefined ? "default" : String(name),
@@ -2058,9 +2062,18 @@ const __makeDurableObjectClass = (
   };
   // Anonymous Worker Loader classes have no script identity; cache their local
   // loader id once it resolves so same-process RPC can still transfer them.
-  meta.idPromise.then((id) => { meta.transferId = id; }, () => {});
+  if (meta.idPromise !== undefined)
+    meta.idPromise.then((id) => { meta.transferId = id; }, () => {});
   __durableClassMeta.set(value, meta);
   return value;
+};
+const __durableClassLoaderId = (meta) => {
+  if (meta.idPromise === undefined) {
+    meta.idPromise = Promise.resolve(meta.idFactory());
+    meta.idFactory = undefined;
+    meta.idPromise.then((id) => { meta.transferId = id; }, () => {});
+  }
+  return meta.idPromise;
 };
 const __facetMeta = new WeakMap();
 class DurableObjectFacets {
@@ -2104,7 +2117,7 @@ class DurableObjectFacets {
         if (meta === undefined)
           throw new TypeError(
             "FacetStartupOptions.class must be a DurableObjectClass.");
-        const loader = await meta.idPromise;
+        const loader = await __durableClassLoaderId(meta);
         const id = options.id instanceof DurableObjectId
           ? options.id.toString()
           : options.id === undefined ? this._state.id.toString() : String(options.id);
@@ -3793,7 +3806,7 @@ const __stubRevive = (value) => {
       const name = v.n === undefined ? "default" : String(v.n);
       const props = revive(v.p);
       return __makeDurableObjectClass(
-        __serviceClassLoader(String(serviceClassScript), name),
+        () => __serviceClassLoader(String(serviceClassScript), name),
         name, { props }, undefined, String(serviceClassScript));
     }
     const durableClassLoader = v["__celld$doClass"];
@@ -4505,7 +4518,7 @@ const __storedRevive = (value) => {
       const name = v.n === undefined ? "default" : String(v.n);
       const props = revive(v.p);
       return __makeDurableObjectClass(
-        __serviceClassLoader(String(serviceClassScript), name),
+        () => __serviceClassLoader(String(serviceClassScript), name),
         name, { props }, undefined, String(serviceClassScript));
     }
     const doClass = v["__celld$do"];
