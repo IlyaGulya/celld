@@ -75,6 +75,21 @@ AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
 
 The HA test starts two production-mode nodes, creates durable state on node A, invokes a returned transient `RpcTarget` through node B, then SIGKILLs A. One request to B must wait for ownership turnover and return the same acknowledged durable state without a client-side retry loop. Use only a disposable bucket prefix: the script deploys its fixture there.
 
+### Object-store restore
+
+To prove the fleet object store is the backup boundary rather than a node's local `CELLD_WATCH`, copy one dedicated source prefix into a different restore prefix and start from an empty local state directory:
+
+```sh
+CELLD_BACKUP_SOURCE=s3://my-test-bucket/source \
+CELLD_BACKUP_RESTORE=s3://my-test-bucket/restore \
+CELLD_BACKUP_ENDPOINT=http://127.0.0.1:9000 \
+CELLD_MC=/path/to/mc \
+AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
+  bash examples/cloudflare-os-compat/restore-test.sh ./target/debug/celld
+```
+
+The script publishes a plain Durable Object fixture, waits for a bucket-durable write, SIGKILLs the source node, mirrors the complete S3 prefix with MinIO `mc`, and starts a restore node with a brand-new local state directory. The restored node must recover the acknowledged value from the copied prefix alone. Use only disposable prefixes.
+
 ### Mixed peer-protocol replacement
 
 When a celld change bumps the authenticated peer protocol, exercise the fail-closed rolling replacement with an old and a new binary:
