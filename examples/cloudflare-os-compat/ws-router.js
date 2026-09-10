@@ -24,6 +24,25 @@ export class ClassHost extends DurableObject {
     }));
     return facet.echo(value);
   }
+
+  async storeServiceStub() {
+    const account = await this.env.PROPS.createChild("stored-service");
+    this.ctx.storage.transactionSync((transaction) => {
+      transaction.kv.put("stored-service-record", {
+        id: 1,
+        account,
+        description: { singleton: { tsType: "Smoke" } },
+      });
+    });
+    return "stored";
+  }
+
+  async readServiceStub(value) {
+    const record = this.ctx.storage.transactionSync((transaction) =>
+      transaction.kv.get("stored-service-record"));
+    if (!record?.account) throw new Error("stored service account is missing");
+    return record.account.echo(value);
+  }
 }
 export default {
   async fetch(request, env) {
@@ -44,6 +63,15 @@ export default {
     }
     if (new URL(request.url).pathname === "/proxy-entrypoint") {
       return Response.json({ result: await env.PROXY_EP.runAt("hello") });
+    }
+
+    if (new URL(request.url).pathname === "/service-stub-store") {
+      const host = env.CLASS_HOST.getByName("stored-service");
+      return Response.json({ result: await host.storeServiceStub() });
+    }
+    if (new URL(request.url).pathname === "/service-stub-read") {
+      const host = env.CLASS_HOST.getByName("stored-service");
+      return Response.json({ result: await host.readServiceStub("hello") });
     }
     return env.SERVICE.fetch(request);
   },

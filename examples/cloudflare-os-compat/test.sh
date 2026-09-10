@@ -190,12 +190,35 @@ run_case "returned service stub" "/returned-service-stub" 'returned-service:hell
 run_case "returned service DO class" "/returned-do-class" 'remote-class:hello'
 run_case "relayed service DO class" "/relayed-do-class" 'relayed-class:hello'
 run_case "Proxy WorkerEntrypoint" "/proxy-entrypoint" 'proxy-entrypoint:hello'
+run_case "stored service stub" "/service-stub-store" 'stored'
 if ws_output="$(node "$ROOT/ws-service-check.mjs" "ws://127.0.0.1:$PORT/" 2>&1)"; then
   printf 'PASS %-28s %s\n' "service WebSocket handoff" "$ws_output"
 else
   printf 'FAIL %-28s %s\n' "service WebSocket handoff" "$ws_output" >&2
   failures=$((failures + 1))
 fi
+
+# Cross-script ServiceStubs are durable account capabilities in Cloudflare OS.
+# Prove a returned props-bearing stub survives DO storage and a real process restart.
+kill "$PID" >/dev/null 2>&1 || true
+wait "$PID" >/dev/null 2>&1 || true
+PID=""
+"$CELLD_BIN" dev "$ROOT/wrangler.ws-router.jsonc" \
+  --service "$ROOT/wrangler.ws-service.jsonc" \
+  --host 127.0.0.1 --port "$PORT" --logs >"$LOG" 2>&1 &
+PID=$!
+for _ in $(seq 1 120); do
+  if curl -sS "$base/" >/dev/null 2>&1; then
+    break
+  fi
+  if ! kill -0 "$PID" >/dev/null 2>&1; then
+    echo "celld exited before stored service stub restart became ready" >&2
+    cat "$LOG" >&2 || true
+    exit 1
+  fi
+  sleep 0.5
+done
+run_case "stored service stub restart" "/service-stub-read" 'stored-service:hello'
 
 if [[ "$failures" -ne 0 ]]; then
   echo >&2
