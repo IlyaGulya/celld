@@ -4882,11 +4882,20 @@ class DurableObjectNamespace {
       // target. Transient capabilities therefore use the process-local bridge
       // transport rather than isolate-local markers; same-isolate stub calls
       // keep their cheaper local path in __stubOp().
-      return async (...args) => invoke(
-        async () => __rpcDes(await __rpc_call(
-          scope, dispatchName ?? null, prop, __rpcOut(args, "bridge"),
-        )),
-      );
+      return (...args) => {
+        const nodeContext = __ctxNow();
+        // Native Durable Object RPC methods return RpcPromise, not an ordinary
+        // Promise. Start the first call eagerly, then let the shared local-value
+        // pipeline resolve properties/calls on its eventual result. This is what
+        // lets Cloudflare OS GatekeeperLoopback do
+        // `overseer.startGatekeeperSession(...).runAt(...)` in a constructor.
+        const call = invoke(
+          async () => __rpcDes(await __rpc_call(
+            scope, dispatchName ?? null, prop, __rpcOut(args, "bridge"),
+          )),
+        );
+        return __makeNode(__valueSession(call), [], nodeContext);
+      };
     }});
     return stub;
   }
