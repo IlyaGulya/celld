@@ -346,6 +346,22 @@ static SERVICE_CLASS_LOADER_TX: OnceLock<
     tokio::sync::mpsc::UnboundedSender<ServiceClassLoaderReq>,
 > = OnceLock::new();
 
+/// A transient RPC capability call whose origin is another fleet node. The
+/// shell owns routing/authentication; the JS runtime owns the request context
+/// and the local V8 handle represented by `bridge_id`.
+pub struct RpcBridgeRemoteReq {
+    pub origin_node: String,
+    pub origin_generation: String,
+    pub bridge_id: u64,
+    pub path: Vec<String>,
+    pub args: Option<Vec<u8>>,
+    pub drop_handle: bool,
+    pub reply: tokio::sync::oneshot::Sender<Result<Vec<u8>>>,
+}
+static RPC_BRIDGE_REMOTE_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<RpcBridgeRemoteReq>> =
+    OnceLock::new();
+static RPC_BRIDGE_PROCESS_GENERATION: OnceLock<String> = OnceLock::new();
+
 /// The persisted identity a consumer settlement must match for one message.
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct QueueLeaseRef {
@@ -390,6 +406,21 @@ pub fn set_svc_rpc_tx(tx: tokio::sync::mpsc::UnboundedSender<SvcRpcReq>) {
 
 pub fn set_service_class_loader_tx(tx: tokio::sync::mpsc::UnboundedSender<ServiceClassLoaderReq>) {
     let _ = SERVICE_CLASS_LOADER_TX.set(tx);
+}
+
+pub fn set_rpc_bridge_remote_tx(tx: tokio::sync::mpsc::UnboundedSender<RpcBridgeRemoteReq>) {
+    let _ = RPC_BRIDGE_REMOTE_TX.set(tx);
+}
+
+pub fn set_rpc_bridge_process_generation(generation: String) {
+    let _ = RPC_BRIDGE_PROCESS_GENERATION.set(generation);
+}
+
+fn rpc_bridge_process_generation() -> &'static str {
+    RPC_BRIDGE_PROCESS_GENERATION
+        .get()
+        .map(String::as_str)
+        .unwrap_or("")
 }
 pub fn set_svc_call_tx(tx: tokio::sync::mpsc::UnboundedSender<SvcCallReq>) {
     let _ = SVC_CALL_TX.set(tx);
@@ -8645,6 +8676,62 @@ fn rpc_bridge_registry() -> &'static Mutex<RpcBridgeRegistry> {
     RPC_BRIDGE_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct RpcBridgeRef {
+    node: String,
+    generation: String,
+    id: u64,
+}
+
+fn parse_rpc_bridge_ref(value: &str) -> Result<RpcBridgeRef, String> {
+    serde_json::from_str(value).map_err(|error| format!("RPC bridge: invalid handle: {error}"))
+}
+
+fn current_node(scope: &mut v8::PinScope) -> String {
+    scope
+        .get_slot::<Arc<BundleFs>>()
+        .expect("Worker isolate has a bundle config")
+        .config
+        .node
+        .clone()
+}
+
+pub async fn rpc_bridge_invoke_local(
+    id: u64,
+    path: Vec<String>,
+    args: Option<Vec<u8>>,
+    drop_handle: bool,
+) -> Result<Vec<u8>> {
+    let bridge = if drop_handle {
+        rpc_bridge_registry().lock().unwrap().remove(&id)
+    } else {
+        rpc_bridge_registry().lock().unwrap().get(&id).cloned()
+    }
+    .ok_or_else(|| anyhow::anyhow!("RPC bridge: stale handle"))?;
+    let slot = bridge
+        .slot
+        .upgrade()
+        .ok_or_else(|| anyhow::anyhow!("RPC bridge: origin isolate is gone"))?;
+    let (reply, receive) = tokio::sync::oneshot::channel();
+    let job = crate::WorkerJob::BridgeRpc {
+        stub_id: bridge.stub_id,
+        path,
+        args,
+        context: bridge.context,
+        drop_handle,
+        reply,
+    };
+    let driving = tokio::spawn(crate::runtime::drive(slot, job, None));
+    match receive.await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(error)) => Err(error),
+        Err(_) => match driving.await {
+            Err(error) => Err(anyhow::anyhow!("RPC bridge task died: {error}")),
+            Ok(()) => Err(anyhow::anyhow!("RPC bridge dropped its result")),
+        },
+    }
+}
+
 /// Remove the registry references for every child of `owner`. The caller
 /// chooses when to drop the returned states, because they can own V8 isolates
 /// and no other isolate can be entered on that thread at destruction time.
@@ -8980,6 +9067,7 @@ fn op_loader_load(
     compat.js_rpc = true;
     let id = LOADER_NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let generation = current_generation(scope);
+    let node = current_node(scope);
     let config = Arc::new(
         WorkerConfig::new(WorkerConfigOptions {
             src,
@@ -8996,7 +9084,7 @@ fn op_loader_load(
             workflow_bindings: Vec::new(),
             ai_binding: None,
             vars: Vec::new(),
-            node: String::new(),
+            node,
             modules,
             compat,
         })
@@ -9173,7 +9261,16 @@ fn op_rpc_bridge_export(
             stub_id,
         },
     );
-    rv.set(v8::Number::new(scope, id as f64).into());
+    let reference = RpcBridgeRef {
+        node: current_node(scope),
+        generation: rpc_bridge_process_generation().to_string(),
+        id,
+    };
+    let encoded = match serde_json::to_string(&reference) {
+        Ok(encoded) => encoded,
+        Err(error) => return loader_throw(scope, &format!("RPC bridge: encode handle: {error}")),
+    };
+    rv.set(v8::String::new(scope, &encoded).unwrap().into());
 }
 
 fn op_rpc_bridge_call(
@@ -9181,7 +9278,10 @@ fn op_rpc_bridge_call(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
-    let id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
+    let reference = match parse_rpc_bridge_ref(&args.get(0).to_rust_string_lossy(scope)) {
+        Ok(reference) => reference,
+        Err(error) => return loader_throw(scope, &error),
+    };
     let path: Vec<String> = match serde_json::from_str(&args.get(1).to_rust_string_lossy(scope)) {
         Ok(path) => path,
         Err(error) => {
@@ -9189,31 +9289,35 @@ fn op_rpc_bridge_call(
         }
     };
     let call_args = (!args.get(2).is_null()).then(|| view_bytes(args.get(2)).unwrap_or_default());
-    let bridge = rpc_bridge_registry().lock().unwrap().get(&id).cloned();
+    let local_node = current_node(scope);
+    let local_generation = rpc_bridge_process_generation().to_string();
     let async_id = asyncrt::enqueue(async move {
-        let bridge = bridge.ok_or_else(|| "RPC bridge: stale handle".to_string())?;
-        let slot = bridge
-            .slot
-            .upgrade()
-            .ok_or_else(|| "RPC bridge: origin isolate is gone".to_string())?;
-        let (reply, receive) = tokio::sync::oneshot::channel();
-        let job = crate::WorkerJob::BridgeRpc {
-            stub_id: bridge.stub_id,
-            path,
-            args: call_args,
-            context: bridge.context,
-            drop_handle: false,
-            reply,
-        };
-        let driving = tokio::spawn(crate::runtime::drive(slot, job, None));
-        match receive.await {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(error)) => Err(format!("{error}")),
-            Err(_) => match driving.await {
-                Err(error) => Err(format!("RPC bridge task died: {error}")),
-                Ok(()) => Err("RPC bridge dropped its result".to_string()),
-            },
+        if reference.node == local_node {
+            if reference.generation != local_generation {
+                return Err("RPC bridge: origin process generation is stale".to_string());
+            }
+            return rpc_bridge_invoke_local(reference.id, path, call_args, false)
+                .await
+                .map_err(|error| format!("{error:#}"));
         }
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        RPC_BRIDGE_REMOTE_TX
+            .get()
+            .ok_or_else(|| "RPC bridge: no remote bridge channel".to_string())?
+            .send(RpcBridgeRemoteReq {
+                origin_node: reference.node,
+                origin_generation: reference.generation,
+                bridge_id: reference.id,
+                path,
+                args: call_args,
+                drop_handle: false,
+                reply,
+            })
+            .map_err(|_| "RPC bridge: remote bridge channel closed".to_string())?;
+        receive
+            .await
+            .map_err(|_| "RPC bridge: remote bridge dispatcher dropped".to_string())?
+            .map_err(|error| format!("{error:#}"))
     });
     rv.set(promise_for(scope, async_id));
 }
@@ -9223,31 +9327,40 @@ fn op_rpc_bridge_drop(
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue<v8::Value>,
 ) {
-    let id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
-    let bridge = rpc_bridge_registry().lock().unwrap().remove(&id);
-    let Some(bridge) = bridge else {
+    let Ok(reference) = parse_rpc_bridge_ref(&args.get(0).to_rust_string_lossy(scope)) else {
         return;
     };
-    let Some(slot) = bridge.slot.upgrade() else {
-        return;
-    };
+    let local_node = current_node(scope);
+    let local_generation = rpc_bridge_process_generation().to_string();
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return;
     };
     handle.spawn(async move {
-        let (reply, receive) = tokio::sync::oneshot::channel();
-        let job = crate::WorkerJob::BridgeRpc {
-            stub_id: bridge.stub_id,
-            path: Vec::new(),
-            args: None,
-            context: bridge.context,
-            drop_handle: true,
-            reply,
-        };
-        let driving = tokio::spawn(crate::runtime::drive(slot, job, None));
-        if receive.await.is_err() {
-            let _ = driving.await;
+        if reference.node == local_node {
+            if reference.generation == local_generation {
+                let _ = rpc_bridge_invoke_local(reference.id, Vec::new(), None, true).await;
+            }
+            return;
         }
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        let Some(sender) = RPC_BRIDGE_REMOTE_TX.get() else {
+            return;
+        };
+        if sender
+            .send(RpcBridgeRemoteReq {
+                origin_node: reference.node,
+                origin_generation: reference.generation,
+                bridge_id: reference.id,
+                path: Vec::new(),
+                args: None,
+                drop_handle: true,
+                reply,
+            })
+            .is_err()
+        {
+            return;
+        }
+        let _ = receive.await;
     });
 }
 

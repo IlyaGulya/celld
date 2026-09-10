@@ -1205,6 +1205,13 @@ pub struct AppHandle {
     pub reload: crate::generation::ReloadSender,
     pub peer_http: reqwest::Client,
     pub peer_auth: Arc<PeerAuth>,
+    /// Fleet membership/ownership adapter. RPC capability routing uses this to
+    /// resolve an origin node id to its current advertised peer address without
+    /// embedding network endpoints in capability markers.
+    pub ownership: Ownership,
+    /// Process generation from the signed node lease. A transient capability is
+    /// valid only for this exact process lifetime, even if the node name is reused.
+    pub process_generation: String,
     pub advertise: String,
     pub websockets: mpsc::UnboundedSender<WebSocketFuture>,
     /// Whether the RPO=0 output gate is armed: hold a local write's response
@@ -1249,6 +1256,13 @@ pub struct AppHandle {
 impl AppHandle {
     pub async fn request(&self, cell: String) -> Result<Routed, RequestError> {
         self.request_with_mode(cell, false, None).await
+    }
+
+    pub async fn node_lease(&self, node: &str) -> anyhow::Result<Option<NodeLeaseRecord>> {
+        self.ownership
+            .read_node_lease(node)
+            .await
+            .map_err(|error| anyhow::anyhow!("read node lease {node}: {error:?}"))
     }
 
     /// Route one test request and retain which asynchronous seam produced the
