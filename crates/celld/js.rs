@@ -4087,6 +4087,10 @@ pub struct WorkerConfig {
     /// isolate built from it carries the value as a slot, so its host calls
     /// resolve against the deployment graph it was built with.
     pub generation: crate::generation::GenerationId,
+    /// Co-hosted service Workers route their ordinary Durable Object classes
+    /// through a script-scoped internal class key. The public class name and
+    /// namespace key remain unchanged; only the fleet cell scope is qualified.
+    script_scoped_do_classes: bool,
     /// The external (`node:*`/`cloudflare:*`) imports of `src`.
     ///
     /// The scan walks the whole bundle, which an esbuild artifact makes
@@ -4188,6 +4192,7 @@ impl WorkerConfig {
             loader_tails: Vec::new(),
             crons: Vec::new(),
             generation: 0,
+            script_scoped_do_classes: false,
             main_imports,
             module_imports,
         }
@@ -4196,6 +4201,11 @@ impl WorkerConfig {
     /// Stamp this Worker with the application generation it serves.
     pub fn with_generation(mut self, generation: crate::generation::GenerationId) -> Self {
         self.generation = generation;
+        self
+    }
+
+    pub fn with_script_scoped_do_classes(mut self, enabled: bool) -> Self {
+        self.script_scoped_do_classes = enabled;
         self
     }
 
@@ -4223,6 +4233,10 @@ impl WorkerConfig {
 
     pub(crate) fn script_name(&self) -> &str {
         &self.script_name
+    }
+
+    pub(crate) fn script_scoped_do_classes(&self) -> bool {
+        self.script_scoped_do_classes
     }
 
     /// Give this Worker the deployment's cron trigger expressions.
@@ -7398,7 +7412,12 @@ impl Worker {
                     .ok_or_else(|| anyhow!("DO class {cn} not exported"))?;
                 register_class(scope, cn, cls)?;
             }
-            inject_namespace_keys(scope, script_name, do_classes)?;
+            inject_namespace_keys(
+                scope,
+                script_name,
+                do_classes,
+                config.script_scoped_do_classes(),
+            )?;
             inject_crons(scope, &config.crons)?;
             inject_workflows(scope, script_name, &config.workflow_bindings)?;
             inject_kv_limits(scope)?;
@@ -11106,6 +11125,23 @@ pub(crate) fn namespace_key(script_name: &str, class_name: &str) -> String {
     }
 }
 
+/// Internal fleet-routing class for one Durable Object export.
+///
+/// Namespace keys already include `(script, class)`, so Durable Object IDs are
+/// script-specific. Co-hosted service Workers also need that identity in the
+/// cell scope used for runtime lookup; otherwise two scripts exporting the same
+/// public class name collide at generation startup. The alias is deliberately
+/// opaque and fixed-size so even a near-limit public class name still fits the
+/// storage scope bound. Reserved runtime classes keep their established names.
+pub(crate) fn routing_class(script_name: &str, class_name: &str, script_scoped: bool) -> String {
+    if !script_scoped || crate::deploy::is_reserved_class(class_name) {
+        return class_name.to_string();
+    }
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(namespace_key(script_name, class_name).as_bytes());
+    format!(".svc.{digest:x}")
+}
+
 /// The cell scope a D1 database lives at, for a caller outside any isolate.
 /// `celld d1` addresses a database over the operator route, which takes a
 /// scope, so this derives what `getByName` derives in the harness, from the
@@ -11218,15 +11254,26 @@ fn register_actor_name(
         }
     }
 
-    let (class_name, id) = actor_scope
+    let (routing_class, id) = actor_scope
         .split_once(':')
         .ok_or_else(|| anyhow!("named Durable Object scope has no class separator"))?;
+    let public_keys_key = v8::String::new(scope, "publicClassKeys").unwrap();
+    let public_keys = cell
+        .get(scope, public_keys_key.into())
+        .and_then(|value| value.to_object(scope))
+        .ok_or_else(|| anyhow!("missing Durable Object public-class registry"))?;
+    let routing_class_key = v8::String::new(scope, routing_class).unwrap();
+    let class_name = public_keys
+        .get(scope, routing_class_key.into())
+        .filter(|value| value.is_string())
+        .map(|value| value.to_rust_string_lossy(scope))
+        .unwrap_or_else(|| routing_class.to_string());
     let namespace_keys_key = v8::String::new(scope, "namespaceKeys").unwrap();
     let namespace_keys = cell
         .get(scope, namespace_keys_key.into())
         .and_then(|value| value.to_object(scope))
         .ok_or_else(|| anyhow!("missing Durable Object namespace registry"))?;
-    let class_name_key = v8::String::new(scope, class_name).unwrap();
+    let class_name_key = v8::String::new(scope, &class_name).unwrap();
     let namespace_key = namespace_keys
         .get(scope, class_name_key.into())
         .filter(|value| value.is_string())

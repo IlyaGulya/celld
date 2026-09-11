@@ -236,6 +236,34 @@ for _ in $(seq 1 120); do
 done
 run_case "stored service stub restart" "/service-stub-read" 'stored-service:hello'
 
+# Cloudflare OS deployments routinely co-host Gatekeepers that reuse generic
+# Durable Object export names such as UserAccount. Public class names may match;
+# their durable identity must still remain script-scoped.
+kill "$PID" >/dev/null 2>&1 || true
+wait "$PID" >/dev/null 2>&1 || true
+PID=""
+rm -rf .celld/dev
+"$CELLD_BIN" dev "$ROOT/wrangler.same-class-router.jsonc" \
+  --service "$ROOT/wrangler.same-class-a.jsonc" \
+  --service "$ROOT/wrangler.same-class-b.jsonc" \
+  --host 127.0.0.1 --port "$PORT" --logs >"$LOG" 2>&1 &
+PID=$!
+for _ in $(seq 1 120); do
+  if curl -sS "$base/" >/dev/null 2>&1; then
+    break
+  fi
+  if ! kill -0 "$PID" >/dev/null 2>&1; then
+    echo "celld exited before same-class co-hosted service test became ready" >&2
+    cat "$LOG" >&2 || true
+    exit 1
+  fi
+  sleep 0.5
+done
+run_case "same class service A first" "/a" 'a:1:shared-name'
+run_case "same class service A second" "/a" 'a:2:shared-name'
+run_case "same class service B first" "/b" 'b:110:shared-name'
+run_case "same class service B second" "/b" 'b:120:shared-name'
+
 if [[ "$failures" -ne 0 ]]; then
   echo >&2
   echo "$failures Cloudflare OS compatibility case(s) failed." >&2

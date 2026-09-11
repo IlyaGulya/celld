@@ -1206,18 +1206,25 @@ impl Generation {
                     .with_asset_binding(asset_binding)
                     .with_loaders(target_loaders)
                     .with_queue_consumers(queue_catalog.clone())
-                    .with_generation(id),
+                    .with_generation(id)
+                    .with_script_scoped_do_classes(true),
             );
             let pool = StatelessRuntime::start(config.clone(), node.clone(), region.clone())?;
             if service_pools.insert(script.clone(), pool).is_some() {
                 return Err(anyhow!("duplicate co-hosted Worker script {script}"));
             }
             for class in target_classes {
-                register_cell_class(&mut cell_configs, class, config.clone(), &|class| {
-                    anyhow!(
-                        "Durable Object class {class} is exported by more than one co-hosted script"
+                let routing_class = js::routing_class(&script, &class, true);
+                register_cell_class(
+                    &mut cell_configs,
+                    routing_class,
+                    config.clone(),
+                    &|routing| {
+                        anyhow!(
+                        "Durable Object routing class {routing} is exported by more than one co-hosted script"
                     )
-                })?;
+                    },
+                )?;
             }
         }
         let cell_isolates: HashMap<String, Arc<crate::pool::Pool>> = cell_configs

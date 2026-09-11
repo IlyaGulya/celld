@@ -52,6 +52,12 @@ Cloudflare OS uses this shape when instantiating Gatekeeper facets.
 
 Cloudflare OS uses this exact shape for `ctx.exports.AdminSettings.getByName("")` during `/api` startup. A self-exported Durable Object therefore has a dual surface: it is callable as a props-bearing `DurableObjectClass` for Facets and also exposes the normal namespace methods (`get`, `getByName`, `idFromName`, and related helpers).
 
+### 9. Same-named Durable Object classes in co-hosted services
+
+The sentinel also starts two service Workers that both export `UserAccount` and both call `getByName("shared-name")`. Their public class names intentionally collide, but their namespace identities are script-scoped. The calls must produce independent durable histories (`a:1`, `a:2` versus `b:110`, `b:120`).
+
+This matches real Cloudflare OS deployments, where unrelated Gatekeepers commonly use generic internal class names such as `UserAccount`. A deployment graph must therefore route Durable Objects by script-scoped identity rather than treating the JavaScript class name as globally unique.
+
 ## Run
 
 Build celld, ensure `esbuild` and `curl` are on `PATH`, then:

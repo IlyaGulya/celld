@@ -1956,9 +1956,10 @@ class DurableObjectStorage {
   }
 }
 class DurableObjectId {
-  constructor(className, value, name = undefined) {
+  constructor(className, value, name = undefined, routingClass = className) {
     Object.defineProperties(this, {
       _className: { value: className },
+      _routingClass: { value: routingClass },
       _value: { value },
     });
     this.name = name;
@@ -1968,7 +1969,7 @@ class DurableObjectId {
   equals(other) {
     return other instanceof DurableObjectId && other._value === this._value;
   }
-  _scope() { return this._className + ":" + this._value; }
+  _scope(routingClass = this._routingClass) { return routingClass + ":" + this._value; }
 }
 globalThis.DurableObjectRoutingError = class DurableObjectRoutingError
   extends Error {
@@ -2241,10 +2242,11 @@ class DurableObjectState {
     const facet = __cell.facetConfigs[scope];
     this._facetDepth = facet?.depth ?? 0;
     const separator = scope.indexOf(":");
-    const className = separator < 0 ? scope : scope.slice(0, separator);
+    const routingClass = separator < 0 ? scope : scope.slice(0, separator);
+    const className = __cell.publicClassKeys[routingClass] ?? routingClass;
     const value = facet?.id ?? (separator < 0 ? scope : scope.slice(separator + 1));
     this.id = new DurableObjectId(
-      className, value, __cell.idNames[scope],
+      className, value, __cell.idNames[scope], routingClass,
     );
     this.props = facet?.props;
   }
@@ -2512,7 +2514,8 @@ class DurableObjectState {
 function _instance(scope) {
   let inst = __cell.instances[scope];
   if (!inst) {
-    const className = scope.split(":")[0];
+    const routingClass = scope.split(":")[0];
+    const className = __cell.publicClassKeys[routingClass] ?? routingClass;
     const cls = __cell.classes[className];
     if (!cls) throw new Error("no DO class " + className);
     const state = new DurableObjectState(scope);
@@ -4726,24 +4729,27 @@ function makeNamespace(className) {
   const namespaceKey = __cell.namespaceKeys[className];
   if (typeof namespaceKey !== "string")
     throw new Error("no Durable Object namespace key for " + className);
-  return new DurableObjectNamespace(className, namespaceKey);
+  const routingClass = __cell.routingClassKeys[className] ?? className;
+  return new DurableObjectNamespace(className, namespaceKey, routingClass);
 }
 // A named class: SDKs sniff bindings by constructor name (workers-rs
 // EnvBinding requires `constructor.name === "DurableObjectNamespace"`).
 class DurableObjectNamespace {
-  constructor(className, namespaceKey) {
+  constructor(className, namespaceKey, routingClass = className) {
     Object.defineProperty(this, "_className", { value: className });
     Object.defineProperty(this, "_namespaceKey", { value: namespaceKey });
+    Object.defineProperty(this, "_routingClass", { value: routingClass });
   }
   idFromName(name) {
     name = String(name);
     return new DurableObjectId(
-      this._className, __do_id(this._namespaceKey, "name", name), name,
+      this._className, __do_id(this._namespaceKey, "name", name), name, this._routingClass,
     );
   }
   idFromString(value) {
     return new DurableObjectId(
-      this._className, __do_id(this._namespaceKey, "validate", String(value)),
+      this._className, __do_id(this._namespaceKey, "validate", String(value)), undefined,
+      this._routingClass,
     );
   }
   newUniqueId(options = {}) {
@@ -4751,7 +4757,7 @@ class DurableObjectNamespace {
     if (jurisdiction != null)
       throw new Error("Jurisdiction restrictions are not implemented");
     return new DurableObjectId(
-      this._className, __do_id(this._namespaceKey, "unique", ""),
+      this._className, __do_id(this._namespaceKey, "unique", ""), undefined, this._routingClass,
     );
   }
   jurisdiction(value) {
@@ -4765,7 +4771,7 @@ class DurableObjectNamespace {
     const className = this._className;
     if (!(id instanceof DurableObjectId) || id._className !== className)
       throw new TypeError("Durable Object ID is not valid for this namespace");
-    const scope = id._scope();
+    const scope = id._scope(this._routingClass);
     // Emulate production: the actor recovers its name only when it is
     // <= 1024 UTF-8 bytes; longer names are dropped so ctx.id.name is
     // undefined. The full name still seeds the routing hash, so
@@ -5634,6 +5640,8 @@ globalThis.__cell = {
   loaderTails: [],
   idNames: {},
   namespaceKeys: {},
+  routingClassKeys: {},
+  publicClassKeys: {},
   node: "",
   deleteAllDeletesAlarm: false,
   compat: { jsRpc: false, fetcherGetPutDelete: false, queueJsonMessages: false },

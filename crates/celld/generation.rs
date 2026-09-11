@@ -352,7 +352,8 @@ impl Generation {
     /// script in the same deployment graph.
     #[doc(hidden)]
     pub fn service_class_config(&self, script: &str, class: &str) -> Option<Arc<WorkerConfig>> {
-        let config = self.cell_configs.get(class)?;
+        let routing_class = crate::js::routing_class(script, class, true);
+        let config = self.cell_configs.get(&routing_class)?;
         (config.script_name() == script).then(|| config.clone())
     }
 
