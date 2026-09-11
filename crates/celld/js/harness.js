@@ -3543,6 +3543,8 @@ const __stubLift = (value, bridge = false) => {
       // A transient stub belongs to the request that received it; another
       // request cannot serialize it (Workerd's IoContext rule).
       if (meta.ctx !== ctx) throw __ctxError("Client");
+      if (meta.entry.bridge !== undefined)
+        __rpc_bridge_transfer(meta.entry.bridge);
       meta.disposed = true; // the ref moves to the receiver
       __ctxUnregister(meta);
       const marker = meta.entry.bridge !== undefined
@@ -3818,6 +3820,7 @@ const __stubRevive = (value) => {
     }
     const bridgeId = v["__celld$bridge"];
     if (bridgeId !== undefined) {
+      __rpc_bridge_adopt(bridgeId);
       const entry = { bridge: bridgeId, refs: 1 };
       const stub = __makeStub(entry, v.c);
       const meta = __stubMeta.get(stub);

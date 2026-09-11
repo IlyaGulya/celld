@@ -361,6 +361,7 @@ pub struct RpcBridgeRemoteReq {
 static RPC_BRIDGE_REMOTE_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<RpcBridgeRemoteReq>> =
     OnceLock::new();
 static RPC_BRIDGE_PROCESS_GENERATION: OnceLock<String> = OnceLock::new();
+static RPC_BRIDGE_PROCESS_NODE: OnceLock<String> = OnceLock::new();
 
 /// The persisted identity a consumer settlement must match for one message.
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
@@ -412,12 +413,23 @@ pub fn set_rpc_bridge_remote_tx(tx: tokio::sync::mpsc::UnboundedSender<RpcBridge
     let _ = RPC_BRIDGE_REMOTE_TX.set(tx);
 }
 
+pub fn set_rpc_bridge_process_node(node: String) {
+    let _ = RPC_BRIDGE_PROCESS_NODE.set(node);
+}
+
 pub fn set_rpc_bridge_process_generation(generation: String) {
     let _ = RPC_BRIDGE_PROCESS_GENERATION.set(generation);
 }
 
 fn rpc_bridge_process_generation() -> &'static str {
     RPC_BRIDGE_PROCESS_GENERATION
+        .get()
+        .map(String::as_str)
+        .unwrap_or("")
+}
+
+fn rpc_bridge_process_node() -> &'static str {
+    RPC_BRIDGE_PROCESS_NODE
         .get()
         .map(String::as_str)
         .unwrap_or("")
@@ -7831,6 +7843,8 @@ fn install_ops(scope: &mut v8::PinScope, context: v8::Local<v8::Context>) {
         "__loader_fetch" => op_loader_fetch,
         "__loader_rpc" => op_loader_rpc,
         "__rpc_bridge_export" => op_rpc_bridge_export,
+        "__rpc_bridge_adopt" => op_rpc_bridge_adopt,
+        "__rpc_bridge_transfer" => op_rpc_bridge_transfer,
         "__rpc_bridge_call" => op_rpc_bridge_call,
         "__rpc_bridge_drop" => op_rpc_bridge_drop,
         "__loader_drop" => op_loader_drop,
@@ -8676,7 +8690,14 @@ fn rpc_bridge_registry() -> &'static Mutex<RpcBridgeRegistry> {
     RPC_BRIDGE_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+/// Number of live transient RPC bridge handles in this process. Exposed in the
+/// operator `/state` snapshot so soak tests can distinguish allocator high-water
+/// from a capability-lifecycle leak without inspecting application payloads.
+pub fn rpc_bridge_registry_len() -> usize {
+    rpc_bridge_registry().lock().unwrap().len()
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
 struct RpcBridgeRef {
     node: String,
     generation: String,
@@ -8730,6 +8751,41 @@ pub async fn rpc_bridge_invoke_local(
             Ok(()) => Err(anyhow::anyhow!("RPC bridge dropped its result")),
         },
     }
+}
+
+fn schedule_rpc_bridge_drop(reference: RpcBridgeRef) {
+    let local_node = rpc_bridge_process_node().to_string();
+    let local_generation = rpc_bridge_process_generation().to_string();
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    handle.spawn(async move {
+        if local_node.is_empty() || reference.node == local_node {
+            if reference.generation == local_generation {
+                let _ = rpc_bridge_invoke_local(reference.id, Vec::new(), None, true).await;
+            }
+            return;
+        }
+        let Some(sender) = RPC_BRIDGE_REMOTE_TX.get() else {
+            return;
+        };
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        if sender
+            .send(RpcBridgeRemoteReq {
+                origin_node: reference.node,
+                origin_generation: reference.generation,
+                bridge_id: reference.id,
+                path: Vec::new(),
+                args: None,
+                drop_handle: true,
+                reply,
+            })
+            .is_err()
+        {
+            return;
+        }
+        let _ = receive.await;
+    });
 }
 
 /// Remove the registry references for every child of `owner`. The caller
@@ -9273,6 +9329,41 @@ fn op_rpc_bridge_export(
     rv.set(v8::String::new(scope, &encoded).unwrap().into());
 }
 
+fn op_rpc_bridge_adopt(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let reference = match parse_rpc_bridge_ref(&args.get(0).to_rust_string_lossy(scope)) {
+        Ok(reference) => reference,
+        Err(error) => return loader_throw(scope, &error),
+    };
+    let Some(context) = installed_context() else {
+        return loader_throw(scope, "RPC bridge: no current request context");
+    };
+    context.adopt_rpc_bridge(reference);
+}
+
+fn op_rpc_bridge_transfer(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let reference = match parse_rpc_bridge_ref(&args.get(0).to_rust_string_lossy(scope)) {
+        Ok(reference) => reference,
+        Err(error) => return loader_throw(scope, &error),
+    };
+    let Some(context) = installed_context() else {
+        return loader_throw(scope, "RPC bridge: no current request context");
+    };
+    if !context.transfer_rpc_bridge(&reference) {
+        loader_throw(
+            scope,
+            "Cannot perform I/O on behalf of a different request. I/O objects (such as streams, request/response bodies, and RPC stubs) created in the context of one request handler cannot be accessed from a different request's handler.",
+        );
+    }
+}
+
 fn op_rpc_bridge_call(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -9330,38 +9421,13 @@ fn op_rpc_bridge_drop(
     let Ok(reference) = parse_rpc_bridge_ref(&args.get(0).to_rust_string_lossy(scope)) else {
         return;
     };
-    let local_node = current_node(scope);
-    let local_generation = rpc_bridge_process_generation().to_string();
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        return;
-    };
-    handle.spawn(async move {
-        if reference.node == local_node {
-            if reference.generation == local_generation {
-                let _ = rpc_bridge_invoke_local(reference.id, Vec::new(), None, true).await;
-            }
-            return;
-        }
-        let (reply, receive) = tokio::sync::oneshot::channel();
-        let Some(sender) = RPC_BRIDGE_REMOTE_TX.get() else {
-            return;
-        };
-        if sender
-            .send(RpcBridgeRemoteReq {
-                origin_node: reference.node,
-                origin_generation: reference.generation,
-                bridge_id: reference.id,
-                path: Vec::new(),
-                args: None,
-                drop_handle: true,
-                reply,
-            })
-            .is_err()
-        {
-            return;
-        }
-        let _ = receive.await;
-    });
+    // Explicit disposal consumes this request's adopted reference. If the stub
+    // is being cleaned up by an older JS-only context path, the remove is a
+    // harmless no-op; the origin drop remains idempotent.
+    if let Some(context) = installed_context() {
+        context.transfer_rpc_bridge(&reference);
+    }
+    schedule_rpc_bridge_drop(reference);
 }
 
 /// `__loader_rpc(id, entrypoint, method, argsSc)` -> Promise<Uint8Array>. The
@@ -12200,6 +12266,10 @@ pub struct IoContext {
     /// Empty for stateless Worker code, which owns no cell and gates
     /// nothing.
     egress: Mutex<Vec<EgressFrame>>,
+    /// Transient fleet RPC capabilities adopted while this request is current.
+    /// Moving a stub through another RPC removes it here; request retirement
+    /// drops anything still held and releases the origin-side bridge handle.
+    rpc_bridges: Mutex<HashSet<RpcBridgeRef>>,
 }
 
 impl IoContext {
@@ -12225,6 +12295,7 @@ impl IoContext {
             body_streams: Mutex::new(HashMap::new()),
             ws_capture: Mutex::new(Vec::new()),
             egress: Mutex::new(Vec::new()),
+            rpc_bridges: Mutex::new(HashSet::new()),
         })
     }
 
@@ -12243,6 +12314,7 @@ impl IoContext {
             body_streams: Mutex::new(HashMap::new()),
             ws_capture: Mutex::new(Vec::new()),
             egress: Mutex::new(Vec::new()),
+            rpc_bridges: Mutex::new(HashSet::new()),
         });
         runtime_state
             .io_contexts
@@ -12250,6 +12322,14 @@ impl IoContext {
             .unwrap()
             .insert(id, Arc::downgrade(&context));
         context
+    }
+
+    fn adopt_rpc_bridge(&self, reference: RpcBridgeRef) {
+        self.rpc_bridges.lock().unwrap().insert(reference);
+    }
+
+    fn transfer_rpc_bridge(&self, reference: &RpcBridgeRef) -> bool {
+        self.rpc_bridges.lock().unwrap().remove(reference)
     }
 
     fn begin_event(&self) {
@@ -12491,6 +12571,15 @@ impl Drop for IoContext {
         // can leave a process-wide input gate active after it is gone.
         let _ = abandon_context_input_gates(self);
         self.close_sockets();
+        let bridge_refs = self
+            .rpc_bridges
+            .get_mut()
+            .unwrap()
+            .drain()
+            .collect::<Vec<_>>();
+        for reference in bridge_refs {
+            schedule_rpc_bridge_drop(reference);
+        }
         let mut claims = self
             .body_streams
             .get_mut()
@@ -12584,7 +12673,6 @@ fn current_context() -> Arc<IoContext> {
     })
 }
 
-#[cfg(celld_internal_tests)]
 fn installed_context() -> Option<Arc<IoContext>> {
     CURRENT.with(|current| current.borrow().clone())
 }

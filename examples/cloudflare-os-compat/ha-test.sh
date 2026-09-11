@@ -81,6 +81,30 @@ remote="$(curl -fsS "http://127.0.0.1:$PORT_B/call")"
 [[ "$remote" == *'"result":"cap:hello:3"'* ]] || { echo "cross-node capability failed: $remote" >&2; exit 1; }
 printf 'PASS %-32s %s\n' "cross-node transient capability" "$remote"
 
+# A transient capability belongs to the receiver's request context. Exercise
+# repeated remote calls without explicit Symbol.dispose and require request-end
+# cleanup to release every origin-side bridge handle.
+for _ in $(seq 1 100); do
+  call="$(curl -fsS "http://127.0.0.1:$PORT_B/call")"
+  [[ "$call" == *'"result":"cap:hello:3"'* ]] || {
+    echo "bridge cleanup probe failed: $call" >&2
+    exit 1
+  }
+done
+bridge_state=""
+for _ in $(seq 1 50); do
+  bridge_state="$(curl -fsS "http://127.0.0.1:$PEER_A/state")"
+  if grep -q '"rpc_bridge_handles":0' <<<"$bridge_state"; then
+    break
+  fi
+  sleep 0.1
+done
+if ! grep -q '"rpc_bridge_handles":0' <<<"$bridge_state"; then
+  echo "transient RPC bridges leaked after request retirement: $bridge_state" >&2
+  exit 1
+fi
+printf 'PASS %-32s %s\n' "request-end bridge cleanup" 'rpc_bridge_handles=0'
+
 kill -9 "$PID_A" >/dev/null 2>&1 || true
 wait "$PID_A" >/dev/null 2>&1 || true
 PID_A=""

@@ -4373,6 +4373,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     )
     .await?;
     let process_generation = actor.lease_spec.generation.clone();
+    celld::js::set_rpc_bridge_process_node(node.clone());
     celld::js::set_rpc_bridge_process_generation(process_generation.clone());
     let ownership_name = actor.ownership.name();
     // Keep the fleet reader beside the readiness task before the actor moves
