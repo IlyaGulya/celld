@@ -15,6 +15,7 @@ PORT_A="${CELLD_HA_PORT_A:-19871}"
 PORT_B="${CELLD_HA_PORT_B:-19872}"
 PEER_A="${CELLD_HA_PEER_A:-19881}"
 PEER_B="${CELLD_HA_PEER_B:-19882}"
+SOAK_CALLS="${CELLD_HA_SOAK_CALLS:-100}"
 TMP="$(mktemp -d)"
 PID_A=""
 PID_B=""
@@ -84,7 +85,7 @@ printf 'PASS %-32s %s\n' "cross-node transient capability" "$remote"
 # A transient capability belongs to the receiver's request context. Exercise
 # repeated remote calls without explicit Symbol.dispose and require request-end
 # cleanup to release every origin-side bridge handle.
-for _ in $(seq 1 100); do
+for _ in $(seq 1 "$SOAK_CALLS"); do
   call="$(curl -fsS "http://127.0.0.1:$PORT_B/call")"
   [[ "$call" == *'"result":"cap:hello:3"'* ]] || {
     echo "bridge cleanup probe failed: $call" >&2
@@ -103,7 +104,7 @@ if ! grep -q '"rpc_bridge_handles":0' <<<"$bridge_state"; then
   echo "transient RPC bridges leaked after request retirement: $bridge_state" >&2
   exit 1
 fi
-printf 'PASS %-32s %s\n' "request-end bridge cleanup" 'rpc_bridge_handles=0'
+printf 'PASS %-32s %s\n' "request-end bridge cleanup" "rpc_bridge_handles=0 after $SOAK_CALLS calls"
 
 kill -9 "$PID_A" >/dev/null 2>&1 || true
 wait "$PID_A" >/dev/null 2>&1 || true
