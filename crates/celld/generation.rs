@@ -347,14 +347,21 @@ impl Generation {
         self.cell_configs.get(class).cloned()
     }
 
-    /// Resolve a DurableObject class capability from a co-hosted service script.
-    /// Both parts are checked together so a class marker cannot retarget another
-    /// script in the same deployment graph.
+    /// Resolve a DurableObject class capability from a service script. Both parts
+    /// are checked together so a class marker cannot retarget another script in
+    /// the same deployment graph.
+    ///
+    /// A co-hosted script registers its classes under the script-scoped routing
+    /// alias (`js::routing_class`), while the primary script registers public
+    /// names, so both spellings are accepted here. The script guard is what keeps
+    /// the lookup scoped: a public name that belongs to another script is refused
+    /// even when it is present in the map.
     #[doc(hidden)]
     pub fn service_class_config(&self, script: &str, class: &str) -> Option<Arc<WorkerConfig>> {
-        let routing_class = crate::js::routing_class(script, class, true);
-        let config = self.cell_configs.get(&routing_class)?;
-        (config.script_name() == script).then(|| config.clone())
+        [crate::js::routing_class(script, class, true), class.to_string()]
+            .into_iter()
+            .find_map(|key| self.cell_configs.get(&key).cloned())
+            .filter(|config| config.script_name() == script)
     }
 
     /// The engine's reserved Durable Object classes this generation
