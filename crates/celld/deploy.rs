@@ -19,7 +19,8 @@ use crate::protocol::{
     ModuleKind, ModuleRef, QueueConsumerAttachment, QueueConsumerConfig, QueueConsumerDeployment,
     Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_CONTAINERS_V1, FEATURE_CRON_V1,
     FEATURE_D1_V1, FEATURE_KV_V1, FEATURE_QUEUES_V1, FEATURE_R2_V1, FEATURE_SQLITE_VEC_V1,
-    FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1, QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
+    FEATURE_WASM_V1, FEATURE_WORKER_LOADER_V1, FEATURE_WORKFLOWS_V1,
+    QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context};
 use flate2::write::GzEncoder;
@@ -294,6 +295,7 @@ struct Project {
     queue_consumers: Vec<QueueConsumerConfig>,
     has_queues: bool,
     has_r2: bool,
+    has_worker_loaders: bool,
     containers: Vec<ContainerDecl>,
 }
 
@@ -634,6 +636,9 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             }
             if project.has_r2 {
                 features.push(FEATURE_R2_V1.to_string());
+            }
+            if project.has_worker_loaders {
+                features.push(FEATURE_WORKER_LOADER_V1.to_string());
             }
             if sqlite_vec {
                 features.push(FEATURE_SQLITE_VEC_V1.to_string());
@@ -1860,6 +1865,9 @@ fn read_project(
         has_queues: !queue_producers.is_empty() || !queue_consumers.is_empty(),
         queue_consumers,
         has_r2: !r2_buckets.is_empty(),
+        // A malformed list is refused where the binding is built; here the only question is whether the
+        // deployment needs the capability at all.
+        has_worker_loaders: matches!(object.get("worker_loaders"), Some(Value::Array(loaders)) if !loaders.is_empty()),
         containers,
     })
 }
