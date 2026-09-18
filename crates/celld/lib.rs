@@ -504,6 +504,17 @@ pub enum WorkerJob {
         request_id: Option<js::RequestId>,
         reply: tokio::sync::oneshot::Sender<anyhow::Result<js::HttpResponse>>,
     },
+    /// One op on a transient capability that crossed an isolate boundary: the
+    /// origin isolate and its local V8 handle are named by the bridge the
+    /// registry holds, and the arguments arrive as structured-clone bytes.
+    BridgeRpc {
+        stub_id: u64,
+        path: Vec<String>,
+        args: Option<Vec<u8>>,
+        context: std::sync::Arc<js::IoContext>,
+        drop_handle: bool,
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<u8>>>,
+    },
     Rpc {
         entrypoint: String,
         operation: WorkerRpcOperation,

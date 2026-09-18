@@ -2202,7 +2202,7 @@ class DurableObjectFacets {
           throw __rpcNoSuchMethod(path[0]);
         return __rpcDes(await __facet_rpc(
           loader, className, this._state._scope, record.owner, name, id,
-          propsSc, path[0], __rpcOut(args, false)));
+          propsSc, path[0], __rpcOut(args, "bridge")));
       }),
     };
     // Arrow closures retain the manager because `target.fetch`'s method
@@ -3941,6 +3941,12 @@ const __disposeStub = (meta) => {
   __ctxUnregister(meta);
   const entry = meta.entry;
   if (--entry.refs > 0) return;
+  // A bridge handle is not an entry of this isolate: the host releases the
+  // origin's local handle instead.
+  if (entry.bridge !== undefined) {
+    __rpc_bridge_drop(entry.bridge);
+    return;
+  }
   __stubEntries.delete(entry.id);
   const disposer = entry.target?.[Symbol.dispose];
   if (typeof disposer === "function")
@@ -4147,7 +4153,12 @@ const __rpcSignalRefresh = () => {
 // it. Passing an existing stub transfers its reference: the
 // sender's handle is disposed (dup() first to keep one) and the
 // receiver adopts it. Returns null when nothing was liftable.
-const __stubLift = (value, allowCapabilities = true, originals) => {
+const __stubLift = (value, transport = true, originals) => {
+  // `transport` names the tier: false refuses capabilities, true is a
+  // same-isolate move, and "bridge" upgrades them to process-local handles
+  // that another isolate can invoke.
+  const allowCapabilities = transport !== false;
+  const bridge = transport === "bridge";
   let lifted = false;
   // Capabilities (stubs, disposers) root the callee context;
   // by-value host types do not -- they pick the 0x02 envelope.
@@ -4188,8 +4199,13 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
       if (meta.ctx !== ctx) throw __ctxError("Client");
       meta.disposed = true; // the ref moves to the receiver
       __ctxUnregister(meta);
-      const marker = { "__celld$stub": meta.entry.id,
-                       t: __stubIsolate, c: meta.callable };
+      const marker = meta.entry.bridge !== undefined
+        ? { "__celld$bridge": meta.entry.bridge, c: meta.callable }
+        : bridge
+          ? { "__celld$bridge": __rpc_bridge_export(meta.entry.id),
+              c: meta.callable }
+          : { "__celld$stub": meta.entry.id,
+              t: __stubIsolate, c: meta.callable };
       seen.set(v, marker);
       return marker;
     }
@@ -4243,9 +4259,13 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
       if (!allowCapabilities) return v;
       lifted = true;
       caps = true;
-      const marker = { "__celld$stub": __newEntry(v).id,
-                       t: __stubIsolate,
-                       c: typeof v === "function" };
+      const entry = __newEntry(v);
+      const marker = bridge
+        ? { "__celld$bridge": __rpc_bridge_export(entry.id),
+            c: typeof v === "function" }
+        : { "__celld$stub": entry.id,
+            t: __stubIsolate,
+            c: typeof v === "function" };
       seen.set(v, marker);
       return marker;
     }
@@ -4443,6 +4463,14 @@ const __stubRevive = (value) => {
   const seen = new Set();
   const revive = (v) => {
     if (v === null || typeof v !== "object") return v;
+    const bridgeId = v["__celld$bridge"];
+    if (bridgeId !== undefined) {
+      const entry = { bridge: bridgeId, refs: 1 };
+      const stub = __makeStub(entry, v.c);
+      const meta = __stubMeta.get(stub);
+      if (meta) handles.push(meta);
+      return stub;
+    }
     const restoreRecipe = v["__celld$restoreRpc"];
     if (restoreRecipe !== undefined)
       return __makeLazyPersistentRestoreRecipeStub(
@@ -4616,6 +4644,13 @@ const __rpcWalk = async (root, path, args, entrypointRoot) => {
 const __stubOp = (meta, path, args) => {
   if (meta.disposed) return Promise.reject(__stubDisposedError());
   const entry = meta.entry;
+  // A bridge handle runs the op in the isolate that owns the target, which is
+  // the only place its V8 handle exists.
+  if (entry.bridge !== undefined) {
+    const argsSc = args === null ? null : __rpcOut(args, "bridge");
+    return (async () => __rpcDes(await __rpc_bridge_call(
+      entry.bridge, JSON.stringify(path), argsSc)))();
+  }
   // A persistent stub names a target nobody has built yet: rebuild it from
   // the recipe, then run the op against the live handle.
   if (entry.restore !== undefined && entry.target === undefined) {
@@ -4697,6 +4732,37 @@ const __stubOp = (meta, path, args) => {
       (error) => { untrack(); reject(error); });
   });
 };
+// The origin-isolate half of a bridged op: the host enters this isolate on
+// behalf of the receiver and hands the local handle's id, the path, and the
+// encoded arguments. A drop releases the handle instead of calling it.
+__celld.__dispatchBridgeRpc = async (stubId, pathJson, argsSc, dropHandle) => {
+  const entry = __stubEntries.get(Number(stubId));
+  if (entry === undefined) throw __stubDisposedError();
+  if (dropHandle) {
+    if (--entry.refs <= 0) {
+      __stubEntries.delete(entry.id);
+      const disposer = entry.target?.[Symbol.dispose];
+      if (typeof disposer === "function")
+        Promise.resolve().then(() => disposer.call(entry.target));
+    }
+    return __rpcOut(undefined, false);
+  }
+  if (entry.released) throw __releasedStubError();
+  if (__abortedCtxs.size !== 0) {
+    const aborted = __abortedCtxs.get(entry.ctx);
+    if (aborted !== undefined) throw __postAbortError(aborted);
+  }
+  const path = JSON.parse(pathJson);
+  const decoded = argsSc === null ? null : __rpcDesArgs(argsSc);
+  try {
+    return await __ctxRun(entry.ctx, () => __rpcRun(async () =>
+      __rpcWalk(entry.target, path,
+        decoded === null ? null : decoded.args, false), "bridge"));
+  } finally {
+    if (decoded !== null)
+      for (const handle of decoded.received) __disposeStub(handle);
+  }
+};
 // Resolve a path against a local, already-revived value. A hop
 // landing on a same-isolate stub delegates the rest of the path
 // to the stub's target; everything else is a plain [[Get]] so
@@ -4748,7 +4814,7 @@ const __entrypointSession = (name, local, script, makeInst, propsSc) => ({
         await __svc_rpc(
           script, name, JSON.stringify(path), null, propsSc)))(),
   call: (path, args) => (async () => {
-    const argsSc = __rpcOut(args, local);
+    const argsSc = __rpcOut(args, local ? true : "bridge");
     if (local)
       return __rpcDes(await __entrypointOp(
         name, path, argsSc, true, makeInst));
@@ -4904,10 +4970,18 @@ const __resolvePersistentRestoreTarget = async (entry) => {
     restoredMeta.disposed = true;
     __ctxUnregister(restoredMeta);
     const restoredEntry = restoredMeta.entry;
-    entry.target = restoredEntry.target;
-    entry.ctx = restoredEntry.ctx;
-    entry.scope = restoredEntry.scope;
-    entry.section = restoredEntry.section;
+    // A restored target that arrived as a bridge handle keeps its handle: the
+    // wrapper's own recipe still resolves it after a restart, and the handle
+    // is what this process calls through until then.
+    if (restoredEntry.bridge !== undefined) {
+      entry.bridge = restoredEntry.bridge;
+      entry.target = undefined;
+    } else {
+      entry.target = restoredEntry.target;
+      entry.ctx = restoredEntry.ctx;
+      entry.scope = restoredEntry.scope;
+      entry.section = restoredEntry.section;
+    }
     return entry.target;
   }
   if (!(target instanceof __cf.RpcTarget) && typeof target !== "function" &&
@@ -5468,7 +5542,7 @@ class DurableObjectNamespace {
       // loud foreign stubs.
       return async (...args) => invoke(
         async () => __rpcDes(await __rpc_call(
-          scope, dispatchName ?? null, prop, __rpcOut(args, true),
+          scope, dispatchName ?? null, prop, __rpcOut(args, "bridge"),
         )),
       );
     }});
@@ -5647,7 +5721,7 @@ __celld.__dispatchRpc = async (scope, method, args) => {
           }
           const [inst, fn] = await __rpcTargetMethod(scope, method);
           return fn.apply(inst, decoded.args);
-        }, true);
+        }, "bridge");
       } finally {
         for (const handle of decoded.received) __disposeStub(handle);
       }

@@ -6230,6 +6230,16 @@ fn begin<'s>(
             props,
             reply,
         } => return begin_entrypoint_rpc(tc, &entrypoint, operation, props, reply),
+        crate::WorkerJob::BridgeRpc {
+            stub_id,
+            path,
+            args,
+            context,
+            drop_handle,
+            reply,
+        } => {
+            return begin_bridge_rpc(tc, stub_id, &path, args, context, drop_handle, reply);
+        }
         crate::WorkerJob::Queue { batch, reply, .. } => {
             return begin_queue(tc, batch, reply);
         }
@@ -6343,6 +6353,80 @@ fn begin_entrypoint_rpc(
                 &[entrypoint.into(), path.into(), args, local.into(), props],
             )
             .ok_or_else(|| anyhow!("entrypoint RPC threw"))?;
+        match ret.try_cast::<v8::Promise>() {
+            Ok(promise) => Ok(promise),
+            Err(_) => resolved_promise(tc, ret),
+        }
+    })();
+    let event_started = Instant::now();
+    match started {
+        Ok(promise) => {
+            tc.perform_microtask_checkpoint();
+            let entry = InFlight {
+                runtime_state: actor_runtime_state(tc),
+                promise: v8::Global::new(tc, promise),
+                context,
+                scope: None,
+                writes_before: None,
+                request_id: None,
+                active_request_id: None,
+                reply: Some(Answer::Rpc(reply)),
+                gated_reply: None,
+                background: None,
+                completed_cell_event: false,
+                ops: std::collections::HashSet::new(),
+                io_context_ops: std::collections::HashSet::new(),
+                unrefed_ops: std::collections::HashSet::new(),
+                alarm: None,
+                started: event_started,
+                trace: None,
+                failure: None,
+            };
+            drop(guard);
+            Begun::Running(Box::new(entry))
+        }
+        Err(error) => {
+            let _ = end_event_context(tc);
+            let error = take_execution_termination(tc).unwrap_or(error);
+            drop(guard);
+            let _ = reply.send(Err(error));
+            Begun::Nothing
+        }
+    }
+}
+
+/// Run one op on a local V8 handle that another isolate reached through a
+/// bridge: the origin isolate is entered as a fresh event, and the reply is
+/// the op's encoded result.
+fn begin_bridge_rpc(
+    tc: &mut v8::PinScope,
+    stub_id: u64,
+    path: &[String],
+    args: Option<Vec<u8>>,
+    context: Arc<IoContext>,
+    drop_handle: bool,
+    reply: tokio::sync::oneshot::Sender<Result<Vec<u8>>>,
+) -> Begun {
+    let guard = CurrentGuard::enter(context.clone());
+    let started = (|| {
+        let f = internal_function(tc, "__dispatchBridgeRpc")?;
+        let stub_id = v8::Number::new(tc, stub_id as f64);
+        let path = serde_json::to_string(path)?;
+        let path = v8::String::new(tc, &path).ok_or_else(|| anyhow!("bridge RPC path"))?;
+        let args: v8::Local<v8::Value> = match args {
+            Some(args) => bytes_value(tc, args),
+            None => v8::null(tc).into(),
+        };
+        let drop_handle = v8::Boolean::new(tc, drop_handle);
+        let recv = v8::undefined(tc).into();
+        begin_event_context(tc)?;
+        let ret = f
+            .call(
+                tc,
+                recv,
+                &[stub_id.into(), path.into(), args, drop_handle.into()],
+            )
+            .ok_or_else(|| anyhow!("bridge RPC threw"))?;
         match ret.try_cast::<v8::Promise>() {
             Ok(promise) => Ok(promise),
             Err(_) => resolved_promise(tc, ret),
@@ -8426,6 +8510,9 @@ ops! { OP_NAMES, install_op_functions,
         "__loader_fetch" => op_loader_fetch,
         "__loader_rpc" => op_loader_rpc,
         "__loader_drop" => op_loader_drop,
+        "__rpc_bridge_export" => op_rpc_bridge_export,
+        "__rpc_bridge_call" => op_rpc_bridge_call,
+        "__rpc_bridge_drop" => op_rpc_bridge_drop,
         "__facet_fetch" => op_facet_fetch,
         "__facet_rpc" => op_facet_rpc,
         "__facet_abort" => op_facet_abort,
@@ -9352,6 +9439,24 @@ pub fn loader_registry() -> &'static std::sync::Mutex<LoaderRegistry> {
     LOADER_REGISTRY.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
+/// One transient capability that crossed an isolate boundary. The handle names
+/// the origin isolate, the request context it belongs to, and the local V8
+/// handle in it; nothing about the target is copied here.
+#[derive(Clone)]
+struct RpcBridgeEntry {
+    slot: Weak<crate::pool::Slot>,
+    context: Arc<IoContext>,
+    stub_id: u64,
+}
+
+type RpcBridgeRegistry = HashMap<u64, RpcBridgeEntry>;
+static RPC_BRIDGE_REGISTRY: OnceLock<Mutex<RpcBridgeRegistry>> = OnceLock::new();
+static RPC_BRIDGE_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn rpc_bridge_registry() -> &'static Mutex<RpcBridgeRegistry> {
+    RPC_BRIDGE_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Remove the registry references for every child of `owner`. The caller
 /// chooses when to drop the returned states, because they can own V8 isolates
 /// and no other isolate can be entered on that thread at destruction time.
@@ -9950,6 +10055,107 @@ impl Drop for RequestBodyGuard {
         let claim = self.0.take();
         run_http_cleanup_from_drop(|| drop(claim));
     }
+}
+
+/// `__rpc_bridge_export(stubId)` -> bridge handle. Mints a process-local name
+/// for one local stub entry so another isolate can invoke it.
+fn op_rpc_bridge_export(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let stub_id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
+    let Some(slot) = crate::pool::current_slot() else {
+        return loader_throw(scope, "RPC bridge: no current isolate slot");
+    };
+    let id = RPC_BRIDGE_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    rpc_bridge_registry().lock().unwrap().insert(
+        id,
+        RpcBridgeEntry {
+            slot: Arc::downgrade(&slot),
+            context: current_context(),
+            stub_id,
+        },
+    );
+    rv.set(v8::Number::new(scope, id as f64).into());
+}
+
+/// `__rpc_bridge_call(bridgeId, pathJson, argsSc)` -> Promise<Uint8Array>. Runs
+/// one op on the origin isolate's V8 handle through a fresh event there.
+fn op_rpc_bridge_call(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
+    let path: Vec<String> = match serde_json::from_str(&args.get(1).to_rust_string_lossy(scope)) {
+        Ok(path) => path,
+        Err(error) => {
+            return loader_throw(scope, &format!("RPC bridge: invalid path: {error}"));
+        }
+    };
+    let call_args = (!args.get(2).is_null()).then(|| view_bytes(args.get(2)).unwrap_or_default());
+    let bridge = rpc_bridge_registry().lock().unwrap().get(&id).cloned();
+    let async_id = asyncrt::enqueue(async move {
+        let bridge = bridge.ok_or_else(|| "RPC bridge: stale handle".to_string())?;
+        let slot = bridge
+            .slot
+            .upgrade()
+            .ok_or_else(|| "RPC bridge: origin isolate is gone".to_string())?;
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        let job = crate::WorkerJob::BridgeRpc {
+            stub_id: bridge.stub_id,
+            path,
+            args: call_args,
+            context: bridge.context,
+            drop_handle: false,
+            reply,
+        };
+        let driving = tokio::spawn(crate::runtime::drive(slot, job, None));
+        match receive.await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(error)) => Err(format!("{error}")),
+            Err(_) => match driving.await {
+                Err(error) => Err(format!("RPC bridge task died: {error}")),
+                Ok(()) => Err("RPC bridge dropped its result".to_string()),
+            },
+        }
+    });
+    rv.set(promise_for(scope, async_id));
+}
+
+/// `__rpc_bridge_drop(bridgeId)`: the last receiving handle is gone, so the
+/// origin isolate releases its local entry too.
+fn op_rpc_bridge_drop(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = args.get(0).integer_value(scope).unwrap_or(0).max(0) as u64;
+    let Some(bridge) = rpc_bridge_registry().lock().unwrap().remove(&id) else {
+        return;
+    };
+    let Some(slot) = bridge.slot.upgrade() else {
+        return;
+    };
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    handle.spawn(async move {
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        let job = crate::WorkerJob::BridgeRpc {
+            stub_id: bridge.stub_id,
+            path: Vec::new(),
+            args: None,
+            context: bridge.context,
+            drop_handle: true,
+            reply,
+        };
+        let driving = tokio::spawn(crate::runtime::drive(slot, job, None));
+        if receive.await.is_err() {
+            let _ = driving.await;
+        }
+    });
 }
 
 /// `__loader_rpc(id, entrypoint, method, argsSc, propsSc)` ->
