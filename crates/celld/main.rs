@@ -20,7 +20,8 @@ use celld::generation::{
 };
 use celld::js::{
     ArmGate, AssetCallReq, Compat, DoCallReq, HttpResponse, HttpResponseWebSocket, QueueBinding,
-    QueueDispatchReq, RpcCallReq, SvcCallReq, SvcRpcReq, WorkerConfigOptions, WorkflowBinding,
+    QueueDispatchReq, RpcBridgeRemoteReq, RpcCallReq, SvcCallReq, SvcRpcReq, WorkerConfigOptions,
+    WorkflowBinding,
 };
 use celld::ownership_store::{now_ms, BucketOwnership};
 use celld::peer_auth::{self, PeerAuth};
@@ -2501,6 +2502,123 @@ async fn dispatch_service_class_loader(app: AppHandle, call: celld::js::ServiceC
     let _ = call.reply.send(response);
 }
 
+/// The peer wire body of one bridged call: a JSON metadata frame whose length
+/// prefixes the encoded arguments, so the arguments never take a JSON round
+/// trip.
+#[derive(serde::Deserialize, serde::Serialize)]
+struct RpcBridgePeerMeta {
+    origin_generation: String,
+    id: u64,
+    path: Vec<String>,
+    has_args: bool,
+    drop_handle: bool,
+}
+
+fn encode_rpc_bridge_peer_body(call: &RpcBridgeRemoteReq) -> anyhow::Result<Vec<u8>> {
+    let meta = serde_json::to_vec(&RpcBridgePeerMeta {
+        id: call.bridge_id,
+        origin_generation: call.origin_generation.clone(),
+        path: call.path.clone(),
+        has_args: call.args.is_some(),
+        drop_handle: call.drop_handle,
+    })?;
+    let meta_len = u32::try_from(meta.len()).context("RPC bridge metadata is too large")?;
+    let args_len = call.args.as_ref().map_or(0, Vec::len);
+    let mut body = Vec::with_capacity(4 + meta.len() + args_len);
+    body.extend_from_slice(&meta_len.to_be_bytes());
+    body.extend_from_slice(&meta);
+    if let Some(args) = &call.args {
+        body.extend_from_slice(args);
+    }
+    Ok(body)
+}
+
+fn decode_rpc_bridge_peer_body(body: &[u8]) -> anyhow::Result<(RpcBridgePeerMeta, Option<Vec<u8>>)> {
+    anyhow::ensure!(body.len() >= 4, "RPC bridge peer body is truncated");
+    let meta_len = u32::from_be_bytes(body[..4].try_into().unwrap()) as usize;
+    anyhow::ensure!(
+        meta_len <= body.len() - 4,
+        "RPC bridge peer metadata length exceeds the request body"
+    );
+    let meta: RpcBridgePeerMeta = serde_json::from_slice(&body[4..4 + meta_len])?;
+    let args = &body[4 + meta_len..];
+    if meta.has_args {
+        Ok((meta, Some(args.to_vec())))
+    } else {
+        anyhow::ensure!(
+            args.is_empty(),
+            "RPC bridge peer body has unexpected argument bytes"
+        );
+        Ok((meta, None))
+    }
+}
+
+/// Forward one bridged op to the node that minted the capability. The origin
+/// is resolved through its signed lease, so a node that moved addresses is
+/// still reached, and a lease whose generation changed is refused rather than
+/// resolving a handle the restarted process never minted.
+async fn dispatch_rpc_bridge_remote(app: AppHandle, call: RpcBridgeRemoteReq) {
+    let result = async {
+        let lease = app.node_lease(&call.origin_node).await?.with_context(|| {
+            format!(
+                "RPC bridge origin node {} has no live lease",
+                call.origin_node
+            )
+        })?;
+        anyhow::ensure!(
+            lease.expires_ms > now_ms(),
+            "RPC bridge origin node {} lease has expired",
+            call.origin_node
+        );
+        anyhow::ensure!(
+            lease.generation == call.origin_generation,
+            "RPC bridge origin node {} process generation changed",
+            call.origin_node
+        );
+        anyhow::ensure!(
+            lease.peer_protocol == peer_auth::PROTOCOL_VERSION,
+            "RPC bridge origin node {} speaks incompatible protocol {}",
+            call.origin_node,
+            lease.peer_protocol
+        );
+        anyhow::ensure!(
+            !lease.addr.is_empty(),
+            "RPC bridge origin node has no advertised address"
+        );
+        let body = encode_rpc_bridge_peer_body(&call)?;
+        let path = "/peer/rpc-bridge";
+        let request = app
+            .peer_http
+            .post(format!("http://{}{}", lease.addr, path))
+            .body(body.clone());
+        let request = app
+            .peer_auth
+            .sign(request, "POST", path, &body, &call.origin_node)?;
+        let response = request
+            .send()
+            .await
+            .context("send RPC bridge peer request")?;
+        peer_auth::validate_response(response.headers())
+            .context("validate RPC bridge peer response")?;
+        let status = response.status();
+        let payload = response
+            .bytes()
+            .await
+            .context("read RPC bridge peer response")?;
+        if !status.is_success() {
+            anyhow::bail!(
+                "RPC bridge peer {} returned {}: {}",
+                call.origin_node,
+                status,
+                String::from_utf8_lossy(&payload)
+            );
+        }
+        Ok(payload.to_vec())
+    }
+    .await;
+    let _ = call.reply.send(result);
+}
+
 async fn dispatch_queue_batch(app: AppHandle, call: QueueDispatchReq) {
     let QueueDispatchReq {
         scope,
@@ -2627,6 +2745,53 @@ async fn internal_probe(request: Request<Incoming>, app: AppHandle) -> HttpReply
             )),
         },
         Err(_) => peer_response(response(StatusCode::BAD_REQUEST, "invalid probe challenge")),
+    }
+}
+
+/// One bridged transient RPC op from a peer that holds a capability this node
+/// minted. The signed peer request is verified first, then the origin process
+/// generation, then the registry lookup -- a handle from an earlier process is
+/// `GONE` rather than a stale target.
+async fn internal_rpc_bridge(request: Request<Incoming>, app: AppHandle) -> HttpReply {
+    let (parts, body) = request.into_parts();
+    let body = match collect_limited_body(body, MAX_PEER_FORWARD_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(error) => return peer_response(body_read_error("RPC bridge", error)),
+    };
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map_or_else(|| parts.uri.path().to_string(), ToString::to_string);
+    if let Err(error) = app.peer_auth.verify(
+        &parts.method,
+        &path_and_query,
+        &parts.headers,
+        &body,
+        app.peer_auth.source(),
+    ) {
+        return peer_response(response(error.status(), error.message()));
+    }
+    if parts.method != hyper::Method::POST {
+        return peer_response(response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method not allowed",
+        ));
+    }
+    let (meta, args) = match decode_rpc_bridge_peer_body(&body) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            return peer_response(response(StatusCode::BAD_REQUEST, format!("{error:#}")));
+        }
+    };
+    if meta.origin_generation != app.process_generation {
+        return peer_response(response(
+            StatusCode::GONE,
+            "RPC bridge origin process generation is stale",
+        ));
+    }
+    match celld::js::rpc_bridge_invoke_local(meta.id, meta.path, args, meta.drop_handle).await {
+        Ok(result) => peer_response(response(StatusCode::OK, result)),
+        Err(error) => peer_response(response(StatusCode::GONE, format!("{error:#}"))),
     }
 }
 
@@ -2907,6 +3072,7 @@ async fn handle_internal(
     let result = match path.as_str() {
         "/peer/probe" => internal_probe(request, app).await,
         "/peer/handoff" => internal_handoff(request, app).await,
+        "/peer/rpc-bridge" if app.runtime.is_some() => internal_rpc_bridge(request, app).await,
         _ if path.starts_with("/peer/log/") => internal_log(request, app, path.clone()).await,
         "/state" => response(StatusCode::OK, app.snapshot().await),
         "/reload" if request.method() != hyper::Method::POST => {
@@ -4199,12 +4365,17 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         shutdown_accept_failure_test_active
             .then(|| Arc::new(celld::node_log::FollowerStore::new(&data_dir, None, &node)))
     });
+    // A transient capability is valid for this exact process lifetime; a
+    // restarted process with the same node name must not resolve the handle.
+    celld::js::set_rpc_bridge_process_generation(process_generation.clone());
     let app = AppHandle {
         tx,
         runtime,
         reload: reload_tx.clone(),
         peer_http,
         peer_auth,
+        ownership: actor.ownership.clone(),
+        process_generation: process_generation.clone(),
         advertise: advertise.clone(),
         websockets: websocket_tx,
         draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -4329,6 +4500,8 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     celld::js::set_svc_rpc_tx(service_rpc_tx);
     let (service_class_loader_tx, mut service_class_loader_rx) = mpsc::unbounded_channel();
     celld::js::set_service_class_loader_tx(service_class_loader_tx);
+    let (rpc_bridge_remote_tx, mut rpc_bridge_remote_rx) = mpsc::unbounded_channel();
+    celld::js::set_rpc_bridge_remote_tx(rpc_bridge_remote_tx);
     let (queue_dispatch_tx, mut queue_dispatch_rx) = mpsc::unbounded_channel();
     celld::js::set_queue_dispatch_tx(queue_dispatch_tx);
     let (asset_call_tx, mut asset_call_rx) = mpsc::unbounded_channel();
@@ -4758,6 +4931,12 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 };
                 service_calls.push(Box::pin(dispatch_service_class_loader(app.clone(), call)));
             }
+            call = rpc_bridge_remote_rx.recv() => {
+                let Some(call) = call else {
+                    anyhow::bail!("RPC bridge remote channel closed");
+                };
+                service_calls.push(Box::pin(dispatch_rpc_bridge_remote(app.clone(), call)));
+            }
             Some(()) = service_calls.next(), if !service_calls.is_empty() => {}
             call = queue_dispatch_rx.recv() => {
                 let Some(call) = call else {
@@ -5081,6 +5260,12 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                     };
                     service_calls.push(Box::pin(dispatch_service_class_loader(app.clone(), call)));
                 }
+                call = rpc_bridge_remote_rx.recv() => {
+                    let Some(call) = call else {
+                        anyhow::bail!("RPC bridge remote channel closed");
+                    };
+                    service_calls.push(Box::pin(dispatch_rpc_bridge_remote(app.clone(), call)));
+                }
                 Some(_) = service_calls.next(), if !service_calls.is_empty() => {}
                 call = queue_dispatch_rx.recv() => {
                     let Some(call) = call else {
@@ -5282,6 +5467,12 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                         anyhow::bail!("service class loader channel closed during shutdown");
                     };
                     service_calls.push(Box::pin(dispatch_service_class_loader(app.clone(), call)));
+                }
+                call = rpc_bridge_remote_rx.recv() => {
+                    let Some(call) = call else {
+                        anyhow::bail!("RPC bridge remote channel closed");
+                    };
+                    service_calls.push(Box::pin(dispatch_rpc_bridge_remote(app.clone(), call)));
                 }
                 Some(_) = service_calls.next(), if !service_calls.is_empty() => {}
                 call = queue_dispatch_rx.recv() => {
