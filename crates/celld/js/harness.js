@@ -4834,17 +4834,51 @@ const __entrypointSession = (name, local, script, makeInst, propsSc) => ({
 // MAX_PROPERTY_DEPTH.
 const __makeNode = (session, path, ctx) => {
   let promise;
-  const value = () => promise ??= (() => {
-    if (path.length === 0) return session.root();
-    if (ctx !== null && ctx !== __ctxNow())
-      return Promise.reject(__ctxError("Pipeline"));
-    return session.get(path);
-  })();
+  let settled = false;
+  let resolvedValue;
+  let disposed = false;
+  const value = () => {
+    if (disposed)
+      return Promise.reject(new Error("RPC promise used after being disposed."));
+    if (promise !== undefined) return promise;
+    const started = (() => {
+      if (path.length === 0) return session.root();
+      if (ctx !== null && ctx !== __ctxNow())
+        return Promise.reject(__ctxError("Pipeline"));
+      return session.get(path);
+    })();
+    promise = Promise.resolve(started).then((resolved) => {
+      settled = true;
+      resolvedValue = resolved;
+      return resolved;
+    }, (error) => {
+      settled = true;
+      throw error;
+    });
+    return promise;
+  };
+  // Disposal reaches what the node resolved to: a capability the far end
+  // minted is released through its own Symbol.dispose.
+  const disposeResolved = (resolved) => {
+    if (resolved === null || resolved === undefined) return;
+    const disposer = resolved[Symbol.dispose];
+    if (typeof disposer === "function") disposer.call(resolved);
+  };
+  const dispose = () => {
+    if (disposed) return;
+    disposed = true;
+    if (settled) {
+      disposeResolved(resolvedValue);
+    } else if (promise !== undefined) {
+      promise.then(disposeResolved, () => {});
+    }
+  };
   const brand =
     path.length === 0 ? __cf.RpcPromise : __cf.RpcProperty;
   return new Proxy(function () {}, {
     getPrototypeOf: () => brand.prototype,
     get: (_b, p) => {
+      if (p === Symbol.dispose) return dispose;
       if (p === "then")
         return (onOk, onErr) => value().then(onOk, onErr);
       if (p === "catch") return (onErr) => value().catch(onErr);
@@ -4858,7 +4892,11 @@ const __makeNode = (session, path, ctx) => {
     },
     apply: (_b, _this, args) => {
       let call;
-      if (ctx !== null && ctx !== __ctxNow()) {
+      if (disposed) {
+        call = Promise.reject(
+          new Error("RPC promise used after being disposed."));
+        call.catch(() => {});
+      } else if (ctx !== null && ctx !== __ctxNow()) {
         call = Promise.reject(__ctxError("JsRpcPromise"));
         call.catch(() => {});
       } else {
