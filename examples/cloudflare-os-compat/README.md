@@ -89,12 +89,14 @@ To prove the fleet object store is the backup boundary rather than a node's loca
 CELLD_BACKUP_SOURCE=s3://my-test-bucket/source \
 CELLD_BACKUP_RESTORE=s3://my-test-bucket/restore \
 CELLD_BACKUP_ENDPOINT=http://127.0.0.1:9000 \
-CELLD_MC=/path/to/mc \
+CELLD_MC=/path/to/mc \   # or ./examples/cloudflare-os-compat/mc-shim.py
 AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
   bash examples/cloudflare-os-compat/restore-test.sh ./target/debug/celld
 ```
 
 The script publishes a plain Durable Object fixture, waits for a bucket-durable write, SIGKILLs the source node, mirrors the complete S3 prefix with MinIO `mc`, and starts a restore node with a brand-new local state directory. The restored node must recover the acknowledged value from the copied prefix alone. Use only disposable prefixes.
+
+`mc` itself is no longer published (`dl.min.io` answers 410 since the project was archived), so `mc-shim.py` in this directory implements the four subcommands the gate needs (`alias set`/`remove`, `mb`, `rm --recursive --force`, `mirror --overwrite`) against the same endpoint, copying server-side. Point `CELLD_MC` at it to run the gate without a MinIO installation.
 
 ### Mixed peer-protocol replacement
 
@@ -108,7 +110,43 @@ AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
     /path/to/old-celld ./target/debug/celld
 ```
 
-The old binary publishes a plain Durable Object fixture and becomes its owner. The new node must explicitly refuse the incompatible owner rather than attempt peer RPC, then recover the latest bucket-acknowledged value after the old owner's lease expires. Finally, the replaced slot rejoins on the new binary and both nodes must read the same value. Use a dedicated disposable bucket prefix.
+The old binary publishes a plain Durable Object fixture and becomes its owner. Which refusal the new node gives depends on the bucket the old one left behind, and the gate asserts whichever the runtime chooses:
+
+- the old runtime's bucket format needs migrating, so the new node refuses to *boot* outright while an old lease is live (`wake_format::ensure_stopped`) - this is what a pre-v0.5.0 node as the old binary produces, and it is what the workflow exercises first;
+- the bucket is already at the running format, so the new node serves and the per-request peer protocol check fails closed with `PeerIncompatible` - what a stock v0.5.0 node as the old binary produces.
+
+Both shapes then require the same proof: after the old node stops and its lease expires, the replacement recovers the latest bucket-acknowledged value, and the replaced slot rejoins on the new binary so both nodes read the same value. Use a dedicated disposable bucket prefix.
+
+### Long-run soak with storage faults
+
+The gates above answer "does a failover work" in seconds. The soak answers what only time answers: does an acknowledged write stay durable across repeated turnovers, do transient-capability bridges leak, does the bucket or a node's memory grow without bound, and do storage faults become lost writes.
+
+```sh
+CELLD_SOAK_BUCKET=s3://my-test-bucket/soak \
+CELLD_SOAK_ENDPOINT=http://127.0.0.1:9000 \
+CELLD_SOAK_DURATION_S=3600 \
+CELLD_SOAK_KILL_EVERY_S=120 \
+CELLD_SOAK_S3_FAULT_PERCENT=2 \
+CELLD_SOAK_S3_FAULT_LATENCY_MS=25 \
+AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
+  bash examples/cloudflare-os-compat/soak-test.sh ./target/debug/celld
+```
+
+The script deploys the same fixture as the HA gate, starts two nodes, drives concurrent writers and readers through both, kills a node on a schedule and brings the same identity back, runs the store behind `s3-fault-proxy.py` when fault injection is on, and judges one PASS/FAIL line per bar:
+
+| Bar | Meaning |
+|---|---|
+| no unexpected errors | a failed call may only land between a `kill` and the matching `rejoin` plus the settle period |
+| no rollback | a read taken after a write was acknowledged never returns a lower value |
+| no invented state | no read exceeds the highest value any writer acknowledged by the end of the run |
+| acknowledged write survived | after the load stops, a fresh read returns exactly the last acknowledged value (RPO=0) |
+| turnover exercised | at least one kill and one rejoin happened |
+| bridges retired | the origin node's `rpc_bridge_handles` is 0 once the load stops |
+| bridges bounded | it never exceeded `CELLD_SOAK_BRIDGE_MAX` during the load |
+| bucket growth bounded | the prefix holds at most `CELLD_SOAK_BYTES_PER_WRITE_MAX` bytes per acknowledged write |
+| node memory bounded | RSS growth after the first quarter stays under `CELLD_SOAK_RSS_GROWTH_MB` (the first minutes are warmup) |
+
+Knobs: `CELLD_SOAK_DURATION_S`, `_KILL_EVERY_S`, `_RESTART_AFTER_S`, `_SETTLE_S`, `_WRITERS`, `_READERS`, `_PACE_MS`, `_S3_FAULT_PERCENT`, `_S3_FAULT_LATENCY_MS`, `_S3_FAULT_SEED`, `_BRIDGE_MAX`, `_BYTES_PER_WRITE_MAX`, `_RSS_GROWTH_MB`, `_QUIESCE_S`. Set `CELLD_SOAK_KEEP_TMP=1` to keep the report, node logs and RSS trajectory instead of deleting the run directory. Use a dedicated disposable bucket prefix.
 
 ## TDD rule
 

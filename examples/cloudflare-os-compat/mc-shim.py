@@ -11,6 +11,7 @@ those gates call:
     mc-shim.py alias remove <name>
     mc-shim.py mb <alias>/<bucket>
     mc-shim.py rm --recursive --force <alias>/<bucket>/<prefix>
+    mc-shim.py du <alias>/<bucket>/<prefix>
     mc-shim.py mirror --overwrite <alias>/<bucket>/<prefix> <alias>/<bucket>/<prefix>
 
 `mirror` copies server-side, because a celld object store mixes SQLite
@@ -148,7 +149,8 @@ def list_objects(client, bucket, prefix):
         for item in root.findall(f"{NS}Contents"):
             key = item.find(f"{NS}Key")
             if key is not None and key.text:
-                keys.append(key.text)
+                size = item.find(f"{NS}Size")
+                keys.append((key.text, int(size.text) if size is not None and size.text else 0))
         if root.findtext(f"{NS}IsTruncated") != "true":
             return keys
         token = root.findtext(f"{NS}NextContinuationToken") or ""
@@ -196,9 +198,15 @@ def main(argv):
         if status not in (200, 204):
             raise SystemExit(f"mc-shim: mb {bucket} failed: {status} {body[:200]}")
         return 0
+    if command == "du":
+        client, bucket, prefix = client_for(argv[-1])
+        objects = list_objects(client, bucket, prefix)
+        total = sum(size for _, size in objects)
+        print(f"{total} bytes in {len(objects)} objects under {argv[-1]}")
+        return 0
     if command == "rm":
         client, bucket, prefix = client_for(argv[-1])
-        for key in list_objects(client, bucket, prefix):
+        for key, _ in list_objects(client, bucket, prefix):
             delete_object(client, bucket, key)
         return 0
     if command == "mirror":
