@@ -2058,6 +2058,9 @@ const __blockLeave = (scope, block, event) => {
     __cellBlocks.delete(scope);
 };
 const __durableClassMeta = new WeakMap();
+// The restore entry of a facet stub: `ctx.restore()` on the facet's owner
+// rebuilds the facet target from its own `[restore](params)`.
+const __facetMeta = new WeakMap();
 let __nextFacetOwner = 1;
 // Takes encoded props, not the caller's options bag: an options bag reaching
 // here is a bag nothing validated, and reading one key out of it is how every
@@ -2193,6 +2196,10 @@ class DurableObjectFacets {
         if (path.length !== 1)
           throw new Error(
             "Pipelined property paths on facets are not supported yet.");
+        // The restore entry is host-internal: a caller reaches the facet's own
+        // methods, never the recipe rebuild that re-mints it.
+        if (path[0] === "__celld$internalRestore")
+          throw __rpcNoSuchMethod(path[0]);
         return __rpcDes(await __facet_rpc(
           loader, className, this._state._scope, record.owner, name, id,
           propsSc, path[0], __rpcOut(args, false)));
@@ -2226,6 +2233,15 @@ class DurableObjectFacets {
         if (typeof prop !== "string") return undefined;
         return __makeNode(session, [prop], null);
       },
+    });
+    // A facet stub reached through ctx.restore() is rebuilt by the facet's own
+    // `[restore](params)`, over the same loaded-worker transport as its
+    // methods.
+    __facetMeta.set(record.stub, {
+      restore: (params) => invoke(async ([loader, className, id, propsSc]) =>
+        __rpcDes(await __facet_rpc(
+          loader, className, this._state._scope, record.owner, name, id,
+          propsSc, "__celld$internalRestore", __rpcOut([params], false)))),
     });
     this._running.set(name, record);
     return record.stub;
@@ -2590,6 +2606,22 @@ class DurableObjectState {
   // Workerd's DurableObjectState.exports (actor-state.h): the same
   // loopback surface as ctx.exports on stateless entrypoints.
   get exports() { return __ctxExports(); }
+  // `ctx.restore(params)`: the object's own `[restore](params)` builds the
+  // target, and the returned stub carries `{scope, params}` as its durable
+  // recipe, so the same target can be rebuilt after an eviction or a restart.
+  async restore(params) {
+    // Params are a durable recipe, not a live capability graph. Clone them now
+    // so a later storage round-trip cannot observe mutations and so an
+    // unsupported value fails at creation time, matching Workerd's contract.
+    const recipe = __restoreRecipeClone(params);
+    const inst = __cell.instances[this._scope];
+    const fn = inst?.[__cf.restore];
+    if (typeof fn !== "function")
+      throw new TypeError(
+        "The current Durable Object does not implement [restore](params).");
+    const target = await fn.call(inst, recipe);
+    return __makePersistentRestoreStub(this._scope, recipe, target);
+  }
   blockConcurrencyWhile(f) {
     // The native context binds the gate and its operations to one driver.
     // Its async continuations keep that driver even inside a foreign turn.
@@ -3181,6 +3213,9 @@ const __finishServiceFetch = async (res, req, replay) => {
 // Reading properties from a Proxy is not a trustworthy brand check, so the
 // metadata lives in a side table that application objects cannot forge.
 const __outboundMeta = new WeakMap();
+// The transport of a Loaded worker's entrypoint stub, so a persistent stub
+// whose target is one can invoke it with a recipe and run `[restore]`.
+const __loaderEntrypointMeta = new WeakMap();
 const __loaderServiceMarker = "__celld$loaderSvc";
 __celld.__makeLoader = () => {
   // `get(name, ...)` is memoized by name to one isolate; `load()` is anonymous.
@@ -3213,21 +3248,35 @@ __celld.__makeLoader = () => {
     // the loaded worker (default -> the "default" export, which
     // register_entrypoints registers like any other). fetch stays on the
     // target. Only single-method calls are supported for now.
-    const session = {
-      get: () => Promise.reject(new Error(
-        "Awaitable properties on loaded workers are not supported yet.")),
-      call: (path, args) => (async () => {
+    //
+    // `selfRecipe` is the durable recipe that produced this entrypoint, when
+    // the caller holds one: it rides the payload so the entrypoint's own
+    // `ctx.restore(params)` can forge stubs whose parent recipe rebuilds this
+    // entrypoint after a restart. `internalRestore` asks the loaded worker to
+    // run the entrypoint's `[restore](params)` itself.
+    const invoke = (path, args, selfRecipe, internalRestore = false) =>
+      (async () => {
         if (path.length !== 1)
           throw new Error(
             "Pipelined property paths on loaded workers are not supported " +
             "yet.");
         const id = await idPromise;
+        const payload = {
+          "__celld$loaderCall": true,
+          a: args,
+          r: selfRecipe,
+          i: internalRestore ? "restore" : undefined,
+        };
         return __rpcDes(
-          await __loader_rpc(id, entrypoint, path[0], __rpcOut(args, false),
-            propsSc));
-      })(),
+          await __loader_rpc(id, entrypoint, path[0],
+            __rpcOut(payload, "bridge"), propsSc));
+      })();
+    const session = {
+      get: () => Promise.reject(new Error(
+        "Awaitable properties on loaded workers are not supported yet.")),
+      call: (path, args) => invoke(path, args, undefined, false),
     };
-    return new Proxy(target, {
+    const stub = new Proxy(target, {
       get: (base, prop) => {
         if (prop === "then") return undefined;
         if (Reflect.has(base, prop)) return Reflect.get(base, prop);
@@ -3235,6 +3284,11 @@ __celld.__makeLoader = () => {
         return __makeNode(session, [prop], null);
       },
     });
+    __loaderEntrypointMeta.set(stub, {
+      invoke,
+      restore: (params) => invoke(["restore"], [params], undefined, true),
+    });
+    return stub;
   };
   // Anonymous load() workers are evicted when their only stub is GC'd: the
   // finalizer drops the worker's isolate so it does not leak. Named get()
@@ -4117,8 +4171,18 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
     if (meta) {
       if (!allowCapabilities) return v;
       lifted = true;
-      caps = true;
       if (meta.disposed) throw __stubDisposedError();
+      // A persistent stub crosses by durable recipe rather than by a transient
+      // isolate handle, so it does not root the sender's context.
+      if (meta.entry.restore !== undefined) {
+        meta.disposed = true;
+        __ctxUnregister(meta);
+        const marker = { "__celld$restoreRpc": __sc_encode(meta.entry.restore),
+                         c: meta.callable };
+        seen.set(v, marker);
+        return marker;
+      }
+      caps = true;
       // A stub belongs to the request that received it; another
       // request cannot serialize it (Workerd's IoContext rule).
       if (meta.ctx !== ctx) throw __ctxError("Client");
@@ -4379,6 +4443,10 @@ const __stubRevive = (value) => {
   const seen = new Set();
   const revive = (v) => {
     if (v === null || typeof v !== "object") return v;
+    const restoreRecipe = v["__celld$restoreRpc"];
+    if (restoreRecipe !== undefined)
+      return __makeLazyPersistentRestoreRecipeStub(
+        __sc_decode(restoreRecipe), v.c === true);
     const stubId = v["__celld$stub"];
     if (stubId !== undefined) {
       const entry = v.t === __stubIsolate
@@ -4548,6 +4616,14 @@ const __rpcWalk = async (root, path, args, entrypointRoot) => {
 const __stubOp = (meta, path, args) => {
   if (meta.disposed) return Promise.reject(__stubDisposedError());
   const entry = meta.entry;
+  // A persistent stub names a target nobody has built yet: rebuild it from
+  // the recipe, then run the op against the live handle.
+  if (entry.restore !== undefined && entry.target === undefined) {
+    return (async () => {
+      entry.target = await __resolvePersistentRestoreTarget(entry);
+      return __stubOp(meta, path, args);
+    })();
+  }
   // The cell that minted this stub left residency, so `entry.target`
   // belongs to an instance this node released. The stub fails here
   // rather than calling into it.
@@ -4586,6 +4662,14 @@ const __stubOp = (meta, path, args) => {
         const decoded =
           argsSc === null ? null : __rpcDesArgs(argsSc);
         try {
+          // A stub of a Loaded worker's entrypoint carries the recipe that
+          // produced the entrypoint, so the entrypoint's own ctx.restore()
+          // can forge further stubs whose parent is that recipe.
+          const loader = __loaderEntrypointMeta.get(entry.target);
+          if (loader !== undefined && entry.restore !== undefined)
+            return await loader.invoke(
+              path, decoded === null ? null : decoded.args, entry.restore,
+              false);
           return await __rpcWalk(entry.target, path,
             decoded === null ? null : decoded.args, false);
         } finally {
@@ -4743,6 +4827,97 @@ const __makeStub = (entry, callable) => {
   __stubMeta.set(stub, meta);
   return stub;
 };
+// ---- persistent restore stubs ----------------------------------
+// `ctx.restore(params)` returns a stub whose durable identity is the recipe
+// that produced it, not a transient handle: `{scope, params}` rooted at the
+// object that ran `[restore]`, or `{parent, params}` for a target forged by a
+// stub the parent recipe resolves to. The recipe crosses RPC and DO storage as
+// data and the target is rebuilt on first use, so the stub survives an
+// eviction and a process restart.
+const __restoreRecipeClone = (value) => __sc_decode(__sc_encode(value));
+const __makePersistentRestoreRecipeStub = (recipe, target) => {
+  let entry;
+  let callable = typeof target === "function";
+  const existing = __stubMeta.get(target);
+  if (existing !== undefined) {
+    if (existing.disposed) throw __stubDisposedError();
+    // Move the live transport into the persistent wrapper. The entry keeps the
+    // same reference count; only the request-owned wrapper changes.
+    existing.disposed = true;
+    __ctxUnregister(existing);
+    entry = existing.entry;
+    callable = existing.callable;
+  } else {
+    if (!(target instanceof __cf.RpcTarget) && typeof target !== "function" &&
+        !__loaderEntrypointMeta.has(target) && !__facetMeta.has(target))
+      throw new TypeError(
+        "[restore](params) must return an RpcTarget, RpcStub, Loader " +
+        "entrypoint, or function.");
+    entry = __newEntry(target);
+  }
+  entry.restore = recipe;
+  return __makeStub(entry, callable);
+};
+const __makePersistentRestoreStub = (scope, params, target) =>
+  __makePersistentRestoreRecipeStub({ scope, params }, target);
+// A recipe that arrives over RPC or from storage names a target nobody has
+// built yet; the stub takes the recipe and resolves it lazily.
+const __makeLazyPersistentRestoreRecipeStub = (recipe, callable = false) => {
+  const entry = __newEntry(undefined);
+  entry.restore = recipe;
+  return __makeStub(entry, callable);
+};
+const __makeLazyPersistentRestoreStub = (scope, params) =>
+  __makeLazyPersistentRestoreRecipeStub({ scope, params });
+const __invokeRestoreOnTarget = async (target, params) => {
+  const cloned = __restoreRecipeClone(params);
+  const loader = __loaderEntrypointMeta.get(target);
+  if (loader !== undefined) return loader.restore(cloned);
+  const facet = __facetMeta.get(target);
+  if (facet !== undefined) return facet.restore(cloned);
+  const fn = target?.[__cf.restore];
+  if (typeof fn === "function") return fn.call(target, cloned);
+  throw new TypeError(
+    "The restored RPC target does not implement [restore](params).");
+};
+const __resolveRestoreRecipe = async (recipe) => {
+  if (recipe?.parent !== undefined) {
+    const parent = await __resolveRestoreRecipe(recipe.parent);
+    return __invokeRestoreOnTarget(parent, recipe.params);
+  }
+  const inst = __cell.instances[recipe.scope] ?? _instance(recipe.scope);
+  const fn = inst?.[__cf.restore];
+  if (typeof fn !== "function")
+    throw new TypeError(
+      "The restored Durable Object no longer implements [restore](params).");
+  return fn.call(inst, __restoreRecipeClone(recipe.params));
+};
+const __resolvePersistentRestoreTarget = async (entry) => {
+  if (entry.bridge !== undefined || entry.target !== undefined) return entry.target;
+  const target = await __resolveRestoreRecipe(entry.restore);
+  const restoredMeta = __stubMeta.get(target);
+  if (restoredMeta !== undefined) {
+    if (restoredMeta.disposed) throw __stubDisposedError();
+    // Move the restored stub's live transport into the persistent wrapper. The
+    // wrapper keeps its own durable recipe, so a later restart resolves it
+    // again instead of depending on this live handle.
+    restoredMeta.disposed = true;
+    __ctxUnregister(restoredMeta);
+    const restoredEntry = restoredMeta.entry;
+    entry.target = restoredEntry.target;
+    entry.ctx = restoredEntry.ctx;
+    entry.scope = restoredEntry.scope;
+    entry.section = restoredEntry.section;
+    return entry.target;
+  }
+  if (!(target instanceof __cf.RpcTarget) && typeof target !== "function" &&
+      !__loaderEntrypointMeta.has(target) && !__facetMeta.has(target))
+    throw new TypeError(
+      "[restore](params) must return an RpcTarget, RpcStub, Loader " +
+      "entrypoint, or function.");
+  entry.target = target;
+  return target;
+};
 // A loopback service stub for one of this worker's own
 // entrypoints -- the ctx.exports surface. Calling the stub itself
 // returns a new stub carrying per-instance props, delivered to
@@ -4811,13 +4986,46 @@ const __storedLift = (value) => {
     // side tables and brands before touching any property -- a
     // stub or pipeline proxy answers every property read with a
     // fresh RpcProperty node.
-    if (__stubMeta.has(v) || v instanceof __cf.RpcTarget)
+    const stubMeta = __stubMeta.get(v);
+    if (stubMeta !== undefined) {
+      if (stubMeta.disposed) throw __stubDisposedError();
+      const recipe = stubMeta.entry.restore;
+      if (recipe !== undefined) {
+        lifted = true;
+        // A nested recipe is encoded whole: its parent chain is data that a
+        // later read re-resolves, never a live handle.
+        const marker = recipe.parent === undefined
+          ? { "__celld$restore": recipe.scope, p: lift(recipe.params) }
+          : { "__celld$restoreRecipe": __sc_encode(recipe) };
+        seen.set(v, marker);
+        return marker;
+      }
+      throw new DOMException(
+        "Durable Object storage can only store stubs with durable identity: " +
+        "service stubs from ctx.exports, Durable Object stubs, and stubs " +
+        "created by ctx.restore(). This value is a transient RPC handle that " +
+        "would not survive a restart.", "DataCloneError");
+    }
+    if (v instanceof __cf.RpcTarget)
       throw new DOMException(
         "Durable Object storage can only store stubs with " +
         "durable identity: service stubs from ctx.exports and " +
         "Durable Object stubs. This value is a transient RPC " +
         "handle that would not survive a restart.",
         "DataCloneError");
+    const durableClass = __durableClassMeta.get(v);
+    if (durableClass !== undefined) {
+      if (durableClass.sourceScript === undefined)
+        throw new DOMException(
+          "Durable Object storage can only store DurableObjectClass values " +
+          "with a stable Worker script identity.", "DataCloneError");
+      lifted = true;
+      const marker = { "__celld$doClassSvc": durableClass.sourceScript,
+                       n: durableClass.name };
+      seen.set(v, marker);
+      if (durableClass.propsSc !== undefined) marker.p = durableClass.propsSc;
+      return marker;
+    }
     const svc = __svcMeta.get(v);
     if (svc !== undefined) {
       lifted = true;
@@ -4871,9 +5079,25 @@ const __storedRevive = (value) => {
   const seen = new Set();
   const revive = (v) => {
     if (v === null || typeof v !== "object") return v;
+    const restoreRecipe = v["__celld$restoreRecipe"];
+    if (restoreRecipe !== undefined)
+      return __makeLazyPersistentRestoreRecipeStub(__sc_decode(restoreRecipe));
+    const restoreScope = v["__celld$restore"];
+    if (restoreScope !== undefined)
+      return __makeLazyPersistentRestoreStub(restoreScope, revive(v.p));
     const svcName = v["__celld$svc"];
     if (svcName !== undefined)
       return __entrypointStub(svcName, revive(v.p));
+    const classScript = v["__celld$doClassSvc"];
+    if (classScript !== undefined) {
+      const name = v.n === undefined ? "default" : String(v.n);
+      const propsSc = revive(v.p);
+      const idSource = classScript === __cell.script
+        ? () => __selfLoaderId ??= __loader_self()
+        : () => __serviceClassLoader(String(classScript), name);
+      return __makeDurableObjectClass(
+        idSource, name, propsSc, String(classScript));
+    }
     const doClass = v["__celld$do"];
     if (doClass !== undefined)
       return __cell.makeNamespace(doClass).get(
@@ -5405,6 +5629,22 @@ __celld.__dispatchRpc = async (scope, method, args) => {
             const broken = __brokenActors.get(scope);
             if (broken !== undefined) throw broken;
           }
+          // The restore entry is host-internal: a facet or Durable Object
+          // rebuilt from a recipe runs its own `[restore](params)`.
+          if (method === "__celld$internalRestore") {
+            if (!Array.isArray(decoded.args) || decoded.args.length !== 1)
+              throw new TypeError(
+                "internal restore requires exactly one params argument");
+            const inst = await _readyInstance(scope);
+            if (!inst.__celldState._rpcOk)
+              throw new TypeError(
+                "The receiving Durable Object does not support RPC.");
+            const fn = inst[__cf.restore];
+            if (typeof fn !== "function")
+              throw new TypeError(
+                "The Durable Object does not implement [restore](params).");
+            return fn.call(inst, __restoreRecipeClone(decoded.args[0]));
+          }
           const [inst, fn] = await __rpcTargetMethod(scope, method);
           return fn.apply(inst, decoded.args);
         }, true);
@@ -5667,6 +5907,47 @@ const __entrypointOp = (name, path, argsSc, local, makeInst, props) => {
   __pending_event_begin(pendingId);
   const running = (async () => {
   const decoded = argsSc === null ? null : __rpcDesArgs(argsSc);
+  // A Loaded worker's entrypoint call carries its own envelope: the method
+  // arguments, plus the durable recipe that produced the entrypoint and,
+  // for a restore, the request to run `[restore]` itself.
+  let scopedInst;
+  let selfRecipe;
+  let internalRestore = false;
+  if (makeInst === undefined && decoded !== null &&
+      decoded.args !== null && !Array.isArray(decoded.args) &&
+      typeof decoded.args === "object" &&
+      decoded.args["__celld$loaderCall"] === true) {
+    const envelope = decoded.args;
+    selfRecipe = envelope.r;
+    internalRestore = envelope.i === "restore";
+    decoded.args = envelope.a;
+    makeInst = () => {
+      if (scopedInst !== undefined) return scopedInst;
+      const cls = __entrypointClass(name);
+      // The entrypoint's own ctx.restore(params) forges a stub whose parent
+      // recipe rebuilds this entrypoint: the recipe the caller supplied, not
+      // a handle to this isolate.
+      const restoreFn = selfRecipe === undefined ? undefined : async (params) => {
+        const inner = __restoreRecipeClone(params);
+        const fn = scopedInst?.[__cf.restore];
+        if (typeof fn !== "function")
+          throw new TypeError(
+            "The current WorkerEntrypoint does not implement [restore](params).");
+        const target = await fn.call(scopedInst, inner);
+        return __makePersistentRestoreRecipeStub({
+          parent: __restoreRecipeClone(selfRecipe),
+          params: inner,
+        }, target);
+      };
+      const ctx = __beginEvent(props, restoreFn);
+      try {
+        scopedInst = new cls(ctx, __cell.env);
+      } finally {
+        __endEvent();
+      }
+      return scopedInst;
+    };
+  }
   let drain = null;
   try {
     const reply = await __rpcRun(async () => {
@@ -5694,14 +5975,26 @@ const __entrypointOp = (name, path, argsSc, local, makeInst, props) => {
           // invocation.
           const inst = makeInst !== undefined ? makeInst()
             : __newEntrypointInstance(name, props);
-          result = __rpcWalk(inst, path,
-            decoded === null ? null : decoded.args, true);
+          if (internalRestore) {
+            if (decoded === null || !Array.isArray(decoded.args) ||
+                decoded.args.length !== 1)
+              throw new TypeError(
+                "internal restore requires exactly one params argument");
+            const fn = inst?.[__cf.restore];
+            if (typeof fn !== "function")
+              throw new TypeError(
+                "The WorkerEntrypoint does not implement [restore](params).");
+            result = fn.call(inst, __restoreRecipeClone(decoded.args[0]));
+          } else {
+            result = __rpcWalk(inst, path,
+              decoded === null ? null : decoded.args, true);
+          }
         }
       } finally {
         drain = __endEvent();
       }
       return await result;
-    }, local);
+    }, internalRestore || !local ? "bridge" : true);
     // Registered work drains before a plain reply. A
     // capability-bearing reply (tag 1) must not wait: a returned
     // stream's chunks may be produced by that very work, which
@@ -10564,6 +10857,10 @@ const __cf = __celld.__cf = {
   RpcPromise: class RpcPromise extends Promise {},
   RpcProperty: class RpcProperty {},
   ServiceStub: class ServiceStub {},
+  // `import { restore } from "cloudflare:workers"`: the computed method name
+  // a Durable Object or WorkerEntrypoint implements to rebuild a durable RPC
+  // target from `ctx.restore(params)`.
+  restore: Symbol("cloudflare:workers:restore"),
   // `import { waitUntil } from "cloudflare:workers"`: register into
   // the current event; outside any event this is Workerd's
   // global-scope error.
@@ -11964,17 +12261,24 @@ const __registerWaitUntil = __celld.__registerWaitUntil = (promise) => {
 // `props` are the per-stub props a loopback service stub carries
 // (ctx.props); `exports` is built once, on first access.
 const __defaultProps = {};
-const __entrypointContext = (props = __defaultProps) => ({
-  waitUntil: __registerWaitUntil,
-  passThroughOnException() {},
-  abort: __ctxAbortCurrent,
-  props,
-  get exports() { return __ctxExports(); },
-});
-const __beginEvent = __celld.__beginEvent = (props = __defaultProps) => {
+// `restoreFn` is the entrypoint's own ctx.restore, present only when the
+// caller supplied the recipe that produced this entrypoint.
+const __entrypointContext = (props = __defaultProps, restoreFn) => {
+  const ctx = {
+    waitUntil: __registerWaitUntil,
+    passThroughOnException() {},
+    abort: __ctxAbortCurrent,
+    props,
+    get exports() { return __ctxExports(); },
+  };
+  if (restoreFn !== undefined)
+    Object.defineProperty(ctx, "restore", { value: restoreFn });
+  return ctx;
+};
+const __beginEvent = __celld.__beginEvent = (props = __defaultProps, restoreFn) => {
   __rpcSignalRefresh();
   __event_begin();
-  return __entrypointContext(props);
+  return __entrypointContext(props, restoreFn);
 };
 const __endEvent = __celld.__endEvent = () => __event_end();
 // Workerd's writable filesystem is memory-backed and request-scoped. The
