@@ -790,6 +790,27 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
         lines
     };
     run_internal_snippet(scope, &src).ok_or_else(|| anyhow!("env install failed"))?;
+    // A loaded worker's tail services, minted as ordinary service bindings.
+    if !config.loader_tails.is_empty() {
+        let installer = internal_function(scope, "__installLoaderTails")?;
+        let routes = v8::Array::new(scope, config.loader_tails.len().saturating_mul(3) as i32);
+        for (index, tail) in config.loader_tails.iter().enumerate() {
+            let offset = (index * 3) as u32;
+            let script = v8::String::new(scope, &tail.script).unwrap();
+            routes.set_index(scope, offset, script.into());
+            let entrypoint: v8::Local<v8::Value> = match &tail.entrypoint {
+                Some(name) => v8::String::new(scope, name).unwrap().into(),
+                None => v8::null(scope).into(),
+            };
+            routes.set_index(scope, offset + 1, entrypoint);
+            let props: v8::Local<v8::Value> = super::bytes_value(scope, tail.props.clone());
+            routes.set_index(scope, offset + 2, props);
+        }
+        let undefined = v8::undefined(scope).into();
+        installer
+            .call(scope, undefined, &[routes.into()])
+            .ok_or_else(|| anyhow!("loader tail install failed"))?;
+    }
     if let Some(env) = &config.loader_env {
         let installer = internal_function(scope, "__installLoaderEnv")?;
         // A flat [script, entrypoint, props, ...] array avoids one V8 array

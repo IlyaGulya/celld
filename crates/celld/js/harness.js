@@ -546,12 +546,37 @@ const __fmt = (a) => a.map((x) => {
   try { return JSON.stringify(x); } catch { return String(x); }
 }).join(" ");
 const __consoleNoop = () => {};
+// Traces a Loaded worker's caller asked for, keyed by request context: each
+// console line of a call is one log of that call's trace.
+const __tailCaptures = new Map();
+const __tailPart = (value) => {
+  if (value === null || value === undefined ||
+      typeof value === "string" || typeof value === "number" ||
+      typeof value === "boolean") return value;
+  if (value instanceof Error)
+    return value.stack || (value.name + ": " + value.message);
+  if (typeof value === "bigint" || typeof value === "symbol" ||
+      typeof value === "function") return String(value);
+  try { return JSON.parse(JSON.stringify(value)); } catch { return String(value); }
+};
+const __consoleEmit = (level, args) => {
+  const capture = __tailCaptures.get(__ctxNow());
+  if (capture !== undefined) {
+    capture.logs.push({
+      timestamp: Date.now(),
+      level,
+      message: args.map(__tailPart),
+    });
+  }
+  const prefix = level === "error" ? "ERROR " : level === "warn" ? "WARN " : "";
+  __log(prefix + __fmt(args));
+};
 globalThis.console = {
-  debug: (...a) => __log(__fmt(a)),
-  error: (...a) => __log("ERROR " + __fmt(a)),
-  info: (...a) => __log(__fmt(a)),
-  log: (...a) => __log(__fmt(a)),
-  warn: (...a) => __log("WARN " + __fmt(a)),
+  debug: (...a) => __consoleEmit("debug", a),
+  error: (...a) => __consoleEmit("error", a),
+  info: (...a) => __consoleEmit("info", a),
+  log: (...a) => __consoleEmit("log", a),
+  warn: (...a) => __consoleEmit("warn", a),
   clear: __consoleNoop,
   count: __consoleNoop,
   group: __consoleNoop,
@@ -3437,14 +3462,38 @@ __celld.__makeLoader = () => {
       }
     }
     const { env, envRoutes } = encodeLoaderEnv(c.env);
+    // `tails` are Service Stubs of the caller's env, so they cross as the same
+    // host-minted routes: the marker in the code selects the route.
+    let tails;
+    const tailRoutes = [];
+    if (c.tails !== undefined) {
+      if (!Array.isArray(c.tails))
+        throw new TypeError("Worker Loader tails must be an array.");
+      tails = c.tails.map((value) => {
+        const route = __outboundMeta.get(value);
+        if (route === undefined)
+          throw new TypeError(
+            "Worker Loader tails must be Service Binding capabilities.");
+        const marker = { [__loaderServiceMarker]: tailRoutes.length };
+        tailRoutes.push([
+          route.script,
+          route.entrypoint,
+          route.propsSc ?? (route.props === undefined
+            ? new Uint8Array() : __rpcOut(route.props, false)),
+        ]);
+        return marker;
+      });
+    }
     const {
       globalOutbound: _globalOutbound,
       env: _env,
+      tails: _tails,
       ...rest
     } = c;
     return {
-      config: { ...rest, modules }, wasm, outbound, outboundProps,
-      env, envRoutes,
+      config: tails === undefined ? { ...rest, modules }
+        : { ...rest, modules, tails },
+      wasm, outbound, outboundProps, env, envRoutes, tailRoutes,
     };
   };
   // getCode is deferred into a microtask so a throw (or async getCode)
@@ -3453,11 +3502,11 @@ __celld.__makeLoader = () => {
     Promise.resolve().then(getCode)
       .then((c) => {
         const {
-          config, wasm, outbound, outboundProps, env, envRoutes,
+          config, wasm, outbound, outboundProps, env, envRoutes, tailRoutes,
         } = encodeModules(c);
         return __loader_load(
           JSON.stringify(config), wasm, outbound, outboundProps, env,
-          envRoutes);
+          envRoutes, tailRoutes);
       });
   return {
     load(code) { return makeStub(loadFrom(() => code), true); },
@@ -3616,6 +3665,15 @@ const __makeServiceBinding = __celld.__makeServiceBinding =
   return binding;
 };
 
+// The loaded isolate's tail services, minted from the routes the caller's
+// loader projected. Flat [script, entrypoint, props, ...] like the env.
+__celld.__installLoaderTails = (routes) => {
+  const tails = [];
+  for (let offset = 0; offset + 2 < routes.length; offset += 3)
+    tails.push(__makeServiceBinding(
+      routes[offset], routes[offset + 1], routes[offset + 2]));
+  __cell.loaderTails = tails;
+};
 __celld.__installLoaderEnv = (bytes, routes) => {
   const env = __sc_decode(bytes);
   const seen = new Set();
@@ -3755,6 +3813,31 @@ const __ctxKey = Symbol("celld.ctx");
 const __ctxNow = () => {
   const frame = __als_get();
   return frame === undefined ? undefined : frame.get(__ctxKey);
+};
+// ---- tail events -------------------------------------------------
+// A Loaded worker's caller may attach tail services: every entrypoint call
+// then reports one trace (its method, its console lines, its exceptions) to
+// them, through the same Service Binding transport as a normal call.
+const __tailBegin = (id, rpcMethod) => {
+  if (__cell.loaderTails.length === 0) return null;
+  const trace = { event: { rpcMethod }, logs: [], exceptions: [] };
+  __tailCaptures.set(id, trace);
+  return trace;
+};
+const __tailException = (trace, error) => {
+  if (trace === null) return;
+  trace.exceptions.push({
+    timestamp: Date.now(),
+    name: String(error?.name ?? "Error"),
+    message: String(error?.message ?? error),
+  });
+};
+const __tailFinish = async (id, trace) => {
+  __tailCaptures.delete(id);
+  if (trace === null) return;
+  await Promise.allSettled(
+    __cell.loaderTails.map((tail) => tail.tail([trace])),
+  );
 };
 // Run `fn` under context `id` (undefined = a fresh one). An async
 // fn started inside keeps the frame across its awaits. The prior
@@ -6076,6 +6159,7 @@ const __entrypointOp = (name, path, argsSc, local, makeInst, props) => {
   __pending_event_begin(pendingId);
   const running = (async () => {
   const decoded = argsSc === null ? null : __rpcDesArgs(argsSc);
+  const tailTrace = __tailBegin(id, path[0] ?? "");
   // A Loaded worker's entrypoint call carries its own envelope: the method
   // arguments, plus the durable recipe that produced the entrypoint and,
   // for a restore, the request to run `[restore]` itself.
@@ -6162,7 +6246,12 @@ const __entrypointOp = (name, path, argsSc, local, makeInst, props) => {
       } finally {
         drain = __endEvent();
       }
-      return await result;
+      try {
+        return await result;
+      } catch (error) {
+        __tailException(tailTrace, error);
+        throw error;
+      }
     }, internalRestore || !local ? "bridge" : true);
     // Registered work drains before a plain reply. A
     // capability-bearing reply (tag 1) must not wait: a returned
@@ -6170,6 +6259,7 @@ const __entrypointOp = (name, path, argsSc, local, makeInst, props) => {
     // cannot finish until the caller pulls (returnReadableStream's
     // waitUntil writer would deadlock behind its own reply).
     if (reply[0] !== 1 && drain !== null) await drain;
+    await __tailFinish(id, tailTrace);
     // ctx.abort() during the call supersedes its result; the raw
     // reason rejects the caller (same isolate -- identity holds).
     if (__abortedCtxs.size !== 0) {
@@ -6184,6 +6274,7 @@ const __entrypointOp = (name, path, argsSc, local, makeInst, props) => {
     if (reply[0] !== 1) __ctxEnd(id);
     return reply;
   } finally {
+    __tailCaptures.delete(id);
     if (decoded !== null)
       for (const handle of decoded.received) __disposeStub(handle);
   }
@@ -6421,6 +6512,8 @@ const __cell = __celld.__cell = {
   env: {},
   idNames: {},
   namespaceKeys: {},
+  // Tail services a Worker Loader caller attached, as service bindings.
+  loaderTails: [],
   routingClassKeys: {},
   publicClassKeys: {},
   node: "",

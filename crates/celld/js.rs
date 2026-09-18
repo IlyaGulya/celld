@@ -4057,6 +4057,15 @@ struct LoaderEnv {
     routes: Vec<LoaderEnvRoute>,
 }
 
+/// One tail service a Worker Loader caller attached: a Service Binding of the
+/// caller's env, delivered every trace of the loaded worker's calls.
+#[derive(Clone)]
+struct LoaderTail {
+    script: String,
+    entrypoint: Option<String>,
+    props: Vec<u8>,
+}
+
 pub struct WorkerConfig {
     src: String,
     pub script_name: String,
@@ -4102,6 +4111,9 @@ pub struct WorkerConfig {
     /// Structured-clone values and host-minted service routes that a loaded
     /// worker receives. Loader-only; empty for a normal worker.
     loader_env: Option<LoaderEnv>,
+    /// Tail services the caller attached to a loaded worker. Loader-only:
+    /// every entrypoint call of that worker reports one trace to each.
+    loader_tails: Vec<LoaderTail>,
     /// `triggers.crons` from the deployment. Empty for a loaded worker and for
     /// any script without cron triggers.
     pub crons: Vec<String>,
@@ -4212,6 +4224,7 @@ impl WorkerConfig {
             loader_bindings: Vec::new(),
             egress: EgressPolicy::Allow,
             loader_env: None,
+            loader_tails: Vec::new(),
             crons: Vec::new(),
             containers: Vec::new(),
             generation: 0,
@@ -4298,6 +4311,12 @@ impl WorkerConfig {
     /// Merge the caller's structured-clone `env` onto a loaded worker's env.
     fn with_loader_env(mut self, env: Option<LoaderEnv>) -> Self {
         self.loader_env = env;
+        self
+    }
+
+    /// Attach the caller's tail services to a loaded worker.
+    fn with_loader_tails(mut self, tails: Vec<LoaderTail>) -> Self {
+        self.loader_tails = tails;
         self
     }
 
@@ -9647,7 +9666,7 @@ fn op_loader_load(
     // caller requested, which is more dangerous than refusing the load. Keep
     // this check in the host op so both load() and the lazy get() path cross
     // the same enforcement boundary.
-    for field in ["limits", "tails", "allowExperimental"] {
+    for field in ["limits", "allowExperimental"] {
         if code.get(field).is_some() {
             return loader_throw(
                 scope,
@@ -9718,6 +9737,49 @@ fn op_loader_load(
             let mut bytes = vec![0u8; view.byte_length()];
             view.copy_contents(&mut bytes);
             modules.push((name, ModuleSource::Wasm(bytes.into())));
+        }
+    }
+    // Tail services: `code.tails` holds one marker per tail and the routes
+    // arrive side-band, exactly as the env's capabilities do. A caller that
+    // asks for tails gets the worker's traces delivered to its own services.
+    let tails_arg = args.get(6);
+    let mut loader_tails: Vec<LoaderTail> = Vec::new();
+    if let Some(entries) = code.get("tails") {
+        let Some(entries) = entries.as_array() else {
+            return loader_throw(scope, "worker loader: tails must be an array");
+        };
+        let Ok(routes) = v8::Local::<v8::Array>::try_from(tails_arg) else {
+            return loader_throw(scope, "worker loader: tail routes are not an array");
+        };
+        if entries.len() != routes.length() as usize {
+            return loader_throw(
+                scope,
+                "worker loader: tail routes do not match the declared tails",
+            );
+        }
+        for index in 0..routes.length() {
+            let Some(entry) = routes
+                .get_index(scope, index)
+                .and_then(|value| v8::Local::<v8::Array>::try_from(value).ok())
+            else {
+                return loader_throw(scope, "worker loader: malformed tail route");
+            };
+            let Some(script) = entry.get_index(scope, 0).filter(|value| value.is_string())
+            else {
+                return loader_throw(scope, "worker loader: malformed tail script");
+            };
+            let entrypoint = entry.get_index(scope, 1).and_then(|value| {
+                (value.is_string()).then(|| value.to_rust_string_lossy(scope))
+            });
+            let Some(props) = entry.get_index(scope, 2).and_then(|value| view_bytes(value))
+            else {
+                return loader_throw(scope, "worker loader: tail props are not bytes");
+            };
+            loader_tails.push(LoaderTail {
+                script: script.to_rust_string_lossy(scope),
+                entrypoint,
+                props: props.to_vec(),
+            });
         }
     }
     // Total module bytes, checked before compiling anything (the oversized
@@ -9892,7 +9954,8 @@ fn op_loader_load(
         .into_dynamic_worker()
         .with_generation(generation)
         .with_egress(egress)
-        .with_loader_env(loader_env),
+        .with_loader_env(loader_env)
+        .with_loader_tails(loader_tails),
     );
     handle.spawn(async move {
         let state = match tokio::task::spawn_blocking(move || Worker::load_config(config)).await {
