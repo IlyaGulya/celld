@@ -4112,6 +4112,10 @@ pub struct WorkerConfig {
     /// isolate built from it carries the value as a slot, so its host calls
     /// resolve against the deployment graph it was built with.
     pub generation: crate::generation::GenerationId,
+    /// Co-hosted service Workers route their ordinary Durable Object classes
+    /// through a script-scoped internal class key. The public class name and
+    /// namespace key remain unchanged; only the fleet cell scope is qualified.
+    script_scoped_do_classes: bool,
     /// The external (`node:*`/`cloudflare:*`) imports of `src`.
     ///
     /// The scan walks the whole bundle, which an esbuild artifact makes
@@ -4211,6 +4215,7 @@ impl WorkerConfig {
             crons: Vec::new(),
             containers: Vec::new(),
             generation: 0,
+            script_scoped_do_classes: false,
             main_imports,
             module_imports,
         }
@@ -4230,6 +4235,18 @@ impl WorkerConfig {
     pub fn with_generation(mut self, generation: crate::generation::GenerationId) -> Self {
         self.generation = generation;
         self
+    }
+
+    /// Route this Worker's Durable Object classes through script-scoped cell
+    /// scopes. A co-hosted script needs it; the primary script keeps public
+    /// names, which is what the operator's routes and the manifest name.
+    pub fn with_script_scoped_do_classes(mut self, enabled: bool) -> Self {
+        self.script_scoped_do_classes = enabled;
+        self
+    }
+
+    pub(crate) fn script_scoped_do_classes(&self) -> bool {
+        self.script_scoped_do_classes
     }
 
     pub fn with_queue_consumers(mut self, consumers: Vec<QueueConsumerRegistration>) -> Self {
@@ -7596,7 +7613,12 @@ impl Worker {
                     .ok_or_else(|| anyhow!("DO class {cn} not exported"))?;
                 register_class(scope, cn, cls)?;
             }
-            inject_namespace_keys(scope, script_name, do_classes)?;
+            inject_namespace_keys(
+                scope,
+                script_name,
+                do_classes,
+                config.script_scoped_do_classes(),
+            )?;
             inject_crons(scope, &config.crons)?;
             inject_workflows(scope, script_name, &config.workflow_bindings)?;
             inject_containers(scope, &config.containers)?;
@@ -8398,6 +8420,8 @@ ops! { OP_NAMES, install_op_functions,
         "__queue_alarm_set_wait" => op_queue_alarm_set_wait,
         "__alarm_get" => op_alarm_get,
         "__alarm_delete" => op_alarm_delete,
+        "__loader_self" => op_loader_self,
+        "__service_class_loader" => op_service_class_loader,
         "__loader_load" => op_loader_load,
         "__loader_fetch" => op_loader_fetch,
         "__loader_rpc" => op_loader_rpc,
@@ -9275,6 +9299,31 @@ struct LoaderOwner {
     principal: LoaderPrincipal,
 }
 
+/// Resolve an exported DurableObjectClass capability received from another
+/// co-hosted Worker into a loader owned by the receiving isolate.
+pub struct ServiceClassLoaderReq {
+    pub generation: crate::generation::GenerationId,
+    pub script: String,
+    pub class_name: String,
+    pub reply: tokio::sync::oneshot::Sender<Result<Arc<WorkerConfig>>>,
+}
+
+static SERVICE_CLASS_LOADER_TX: OnceLock<
+    tokio::sync::mpsc::UnboundedSender<ServiceClassLoaderReq>,
+> = OnceLock::new();
+
+#[doc(hidden)]
+pub fn set_service_class_loader_tx(tx: tokio::sync::mpsc::UnboundedSender<ServiceClassLoaderReq>) {
+    let _ = SERVICE_CLASS_LOADER_TX.set(tx);
+}
+
+/// This isolate's own `WorkerConfig`, registered as a loader once per isolate.
+/// A facet of one of the worker's own Durable Object classes runs in a loaded
+/// isolate of the same config, so the existing facet storage and fencing path
+/// carries it instead of a second facet runtime.
+#[derive(Clone, Copy)]
+struct SelfLoaderId(u64);
+
 impl LoaderOwner {
     fn fresh(script: &str, generation: crate::generation::GenerationId) -> Self {
         Self {
@@ -9374,6 +9423,103 @@ async fn loaded_worker_slot(
             .await
             .map_err(|_| "worker loader: load task dropped".to_string())?;
     }
+}
+
+/// `__loader_self()` -> stub id. Registers this deployment's own WorkerConfig
+/// as a loader-backed runtime once per isolate, so `ctx.exports` can expose
+/// same-script DurableObjectClass values through the ordinary facet path.
+fn op_loader_self(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    if let Some(id) = scope.get_slot::<SelfLoaderId>() {
+        rv.set(v8::Number::new(scope, id.0 as f64).into());
+        return;
+    }
+    let owner = scope
+        .get_slot::<LoaderOwner>()
+        .expect("Worker isolate has a Loader owner")
+        .clone();
+    let config = scope
+        .get_slot::<Arc<BundleFs>>()
+        .expect("Worker isolate has a bundle config")
+        .config
+        .clone();
+    let handle = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle,
+        Err(error) => return loader_throw(scope, &format!("worker loader: {error}")),
+    };
+    let (loaded, state) = tokio::sync::watch::channel(LoaderState::Loading);
+    let id = match admit_loaded_worker(owner, state) {
+        Ok(id) => id,
+        Err(error) => return loader_throw(scope, &error),
+    };
+    scope.set_slot(SelfLoaderId(id));
+    handle.spawn(async move {
+        let state = match tokio::task::spawn_blocking(move || Worker::load_config(config)).await {
+            Ok(Ok(worker)) => LoaderState::Ready(crate::pool::Slot::standalone(worker)),
+            Ok(Err(error)) => LoaderState::Failed(Arc::from(format!("{error}"))),
+            Err(error) => LoaderState::Failed(Arc::from(format!(
+                "worker loader: load task failed: {error}"
+            ))),
+        };
+        loaded.send_replace(state);
+    });
+    rv.set(v8::Number::new(scope, id as f64).into());
+}
+
+/// `__service_class_loader(script, class)` -> Promise<loader id>. Resolves an
+/// exported DurableObjectClass of a co-hosted service script into a loader
+/// owned by the receiving isolate. The wire identity of the class is
+/// script + class; the loader id is minted locally and never crosses a node.
+fn op_service_class_loader(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let script = args.get(0).to_rust_string_lossy(scope);
+    let class_name = args.get(1).to_rust_string_lossy(scope);
+    let owner = scope
+        .get_slot::<LoaderOwner>()
+        .expect("Worker isolate has a Loader owner")
+        .clone();
+    let generation = current_generation(scope);
+    let (reply, receive) = tokio::sync::oneshot::channel();
+    let request = ServiceClassLoaderReq {
+        generation,
+        script,
+        class_name,
+        reply,
+    };
+    let async_id = asyncrt::enqueue(async move {
+        let sender = SERVICE_CLASS_LOADER_TX
+            .get()
+            .ok_or_else(|| "no service class loader channel".to_string())?;
+        sender
+            .send(request)
+            .map_err(|_| "service class loader channel closed".to_string())?;
+        let config = match receive.await {
+            Ok(Ok(config)) => config,
+            Ok(Err(error)) => return Err(format!("{error}")),
+            Err(_) => return Err("service class loader dropped its reply".to_string()),
+        };
+        let (loaded, state) = tokio::sync::watch::channel(LoaderState::Loading);
+        let id = admit_loaded_worker(owner, state)?;
+        tokio::spawn(async move {
+            let state = match tokio::task::spawn_blocking(move || Worker::load_config(config)).await
+            {
+                Ok(Ok(worker)) => LoaderState::Ready(crate::pool::Slot::standalone(worker)),
+                Ok(Err(error)) => LoaderState::Failed(Arc::from(format!("{error}"))),
+                Err(error) => LoaderState::Failed(Arc::from(format!(
+                    "worker loader: load task failed: {error}"
+                ))),
+            };
+            loaded.send_replace(state);
+        });
+        Ok(id.to_string())
+    });
+    rv.set(promise_for(scope, async_id));
 }
 
 /// `__loader_load(codeJson, wasm, outbound, outboundProps, envSc, envRoutes)`
@@ -11705,6 +11851,24 @@ fn shared_namespace_key(class_name: &str) -> Option<&'static str> {
     }
 }
 
+/// Internal fleet-routing class for one Durable Object export.
+///
+/// Namespace keys already include `(script, class)`, so Durable Object IDs are
+/// script-specific. Co-hosted service Workers also need that identity in the
+/// cell scope used for runtime lookup; otherwise two scripts exporting the
+/// same public class name collide at generation startup. The alias is
+/// deliberately opaque and fixed-size so even a near-limit public class name
+/// still fits the storage scope bound. Reserved runtime classes keep their
+/// established names.
+pub(crate) fn routing_class(script_name: &str, class_name: &str, script_scoped: bool) -> String {
+    if !script_scoped || crate::deploy::is_reserved_class(class_name) {
+        return class_name.to_string();
+    }
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(namespace_key(script_name, class_name).as_bytes());
+    format!(".svc.{digest:x}")
+}
+
 pub(crate) fn namespace_key(script_name: &str, class_name: &str) -> String {
     match shared_namespace_key(class_name) {
         Some(shared) => shared.to_string(),
@@ -11818,15 +11982,26 @@ fn register_actor_name(
         }
     }
 
-    let (class_name, id) = actor_scope
+    let (routing_class, id) = actor_scope
         .split_once(':')
         .ok_or_else(|| anyhow!("named Durable Object scope has no class separator"))?;
+    let public_keys_key = v8::String::new(scope, "publicClassKeys").unwrap();
+    let public_keys = cell
+        .get(scope, public_keys_key.into())
+        .and_then(|value| value.to_object(scope))
+        .ok_or_else(|| anyhow!("missing Durable Object public-class registry"))?;
+    let routing_class_key = v8::String::new(scope, routing_class).unwrap();
+    let class_name = public_keys
+        .get(scope, routing_class_key.into())
+        .filter(|value| value.is_string())
+        .map(|value| value.to_rust_string_lossy(scope))
+        .unwrap_or_else(|| routing_class.to_string());
     let namespace_keys_key = v8::String::new(scope, "namespaceKeys").unwrap();
     let namespace_keys = cell
         .get(scope, namespace_keys_key.into())
         .and_then(|value| value.to_object(scope))
         .ok_or_else(|| anyhow!("missing Durable Object namespace registry"))?;
-    let class_name_key = v8::String::new(scope, class_name).unwrap();
+    let class_name_key = v8::String::new(scope, &class_name).unwrap();
     let namespace_key = namespace_keys
         .get(scope, class_name_key.into())
         .filter(|value| value.is_string())

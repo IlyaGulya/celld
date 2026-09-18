@@ -2489,6 +2489,18 @@ async fn dispatch_service_rpc(app: AppHandle, call: SvcRpcReq) {
     let _ = call.reply.send(response);
 }
 
+/// Resolve a co-hosted script's exported DurableObject class to the
+/// WorkerConfig a facet of that class is loaded from.
+async fn dispatch_service_class_loader(app: AppHandle, call: celld::js::ServiceClassLoaderReq) {
+    let response = match &app.runtime {
+        Some(runtime) => {
+            runtime.service_class_config(call.generation, &call.script, &call.class_name)
+        }
+        None => Err(anyhow::anyhow!("no Worker runtime")),
+    };
+    let _ = call.reply.send(response);
+}
+
 async fn dispatch_queue_batch(app: AppHandle, call: QueueDispatchReq) {
     let QueueDispatchReq {
         scope,
@@ -4315,6 +4327,8 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     celld::js::set_svc_call_tx(service_call_tx);
     let (service_rpc_tx, mut service_rpc_rx) = mpsc::unbounded_channel();
     celld::js::set_svc_rpc_tx(service_rpc_tx);
+    let (service_class_loader_tx, mut service_class_loader_rx) = mpsc::unbounded_channel();
+    celld::js::set_service_class_loader_tx(service_class_loader_tx);
     let (queue_dispatch_tx, mut queue_dispatch_rx) = mpsc::unbounded_channel();
     celld::js::set_queue_dispatch_tx(queue_dispatch_tx);
     let (asset_call_tx, mut asset_call_rx) = mpsc::unbounded_channel();
@@ -4738,6 +4752,12 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 };
                 service_calls.push(Box::pin(dispatch_service_rpc(app.clone(), call)));
             }
+            call = service_class_loader_rx.recv() => {
+                let Some(call) = call else {
+                    anyhow::bail!("service class loader channel closed");
+                };
+                service_calls.push(Box::pin(dispatch_service_class_loader(app.clone(), call)));
+            }
             Some(()) = service_calls.next(), if !service_calls.is_empty() => {}
             call = queue_dispatch_rx.recv() => {
                 let Some(call) = call else {
@@ -5055,6 +5075,12 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                     };
                     service_calls.push(Box::pin(dispatch_service_rpc(app.clone(), call)));
                 }
+                call = service_class_loader_rx.recv() => {
+                    let Some(call) = call else {
+                        anyhow::bail!("service class loader channel closed during shutdown pre-drain");
+                    };
+                    service_calls.push(Box::pin(dispatch_service_class_loader(app.clone(), call)));
+                }
                 Some(_) = service_calls.next(), if !service_calls.is_empty() => {}
                 call = queue_dispatch_rx.recv() => {
                     let Some(call) = call else {
@@ -5250,6 +5276,12 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                         anyhow::bail!("service RPC channel closed during shutdown");
                     };
                     service_calls.push(Box::pin(dispatch_service_rpc(app.clone(), call)));
+                }
+                call = service_class_loader_rx.recv() => {
+                    let Some(call) = call else {
+                        anyhow::bail!("service class loader channel closed during shutdown");
+                    };
+                    service_calls.push(Box::pin(dispatch_service_class_loader(app.clone(), call)));
                 }
                 Some(_) = service_calls.next(), if !service_calls.is_empty() => {}
                 call = queue_dispatch_rx.recv() => {

@@ -1226,19 +1226,24 @@ impl Generation {
                     .with_queue_consumers(queue_catalog.clone())
                     .with_crons(if is_primary { crons } else { Vec::new() })
                     .with_containers(containers)
-                    .with_generation(id),
+                    .with_generation(id)
+                    .with_script_scoped_do_classes(!is_primary),
             );
             let pool = StatelessRuntime::start(config.clone(), node.clone(), region.clone())?;
             if service_pools.insert(script.clone(), pool).is_some() {
                 return Err(anyhow!("duplicate co-hosted Worker script {script}"));
             }
             for class in classes {
-                register_cell_class(&mut cell_configs, class, config.clone(), &|class| {
+                // A co-hosted script's ordinary classes register under a
+                // script-scoped routing class: two scripts exporting the same
+                // public name keep distinct cells instead of colliding here.
+                let routing_class = js::routing_class(&script, &class, !is_primary);
+                register_cell_class(&mut cell_configs, routing_class, config.clone(), &|routing| {
                     if is_primary {
-                        anyhow!("duplicate Durable Object class {class}")
+                        anyhow!("duplicate Durable Object class {routing}")
                     } else {
                         anyhow!(
-                            "Durable Object class {class} is exported by more than one co-hosted script"
+                            "Durable Object routing class {routing} is exported by more than one co-hosted script"
                         )
                     }
                 })?;
@@ -1794,6 +1799,21 @@ impl RuntimeManager {
             .ok_or_else(|| anyhow!("no service Worker for script {script}"))?
             .rpc(entrypoint, props, operation)
             .await
+    }
+
+    /// Resolve the WorkerConfig that owns one exported DurableObject class in
+    /// a co-hosted service script. The caller's generation fences the lookup.
+    pub fn service_class_config(
+        &self,
+        generation: GenerationId,
+        script: &str,
+        class: &str,
+    ) -> anyhow::Result<Arc<WorkerConfig>> {
+        self.generation_by_id(generation)
+            .service_class_config(script, class)
+            .ok_or_else(|| {
+                anyhow!("service Worker {script} does not export Durable Object class {class}")
+            })
     }
 
     /// Dispatch one broker-leased batch to its attached consumer script.

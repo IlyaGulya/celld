@@ -396,6 +396,7 @@ pub(super) fn inject_namespace_keys(
     scope: &mut v8::PinScope,
     script_name: &str,
     do_classes: &[String],
+    script_scoped: bool,
 ) -> Result<()> {
     let cell = cell_state(scope)?;
     let keys_key = v8::String::new(scope, "namespaceKeys").unwrap();
@@ -403,6 +404,16 @@ pub(super) fn inject_namespace_keys(
         .get(scope, keys_key.into())
         .and_then(|value| value.to_object(scope))
         .ok_or_else(|| anyhow!("missing Durable Object namespace registry"))?;
+    let routing_key = v8::String::new(scope, "routingClassKeys").unwrap();
+    let routing = cell
+        .get(scope, routing_key.into())
+        .and_then(|value| value.to_object(scope))
+        .ok_or_else(|| anyhow!("missing Durable Object routing-class registry"))?;
+    let public_key = v8::String::new(scope, "publicClassKeys").unwrap();
+    let public = cell
+        .get(scope, public_key.into())
+        .and_then(|value| value.to_object(scope))
+        .ok_or_else(|| anyhow!("missing Durable Object public-class registry"))?;
     let script_key = v8::String::new(scope, "script").unwrap();
     let script_value = v8::String::new(scope, script_name).unwrap();
     cell.set(scope, script_key.into(), script_value.into());
@@ -415,6 +426,22 @@ pub(super) fn inject_namespace_keys(
             .unwrap_or(false)
         {
             anyhow::bail!("could not register namespace key for {class_name}");
+        }
+        let routing_class = super::routing_class(script_name, class_name, script_scoped);
+        let routing_value = v8::String::new(scope, &routing_class).unwrap();
+        if !routing
+            .set(scope, class_key.into(), routing_value.into())
+            .unwrap_or(false)
+        {
+            anyhow::bail!("could not register routing class for {class_name}");
+        }
+        let public_routing_key = v8::String::new(scope, &routing_class).unwrap();
+        let public_value = v8::String::new(scope, class_name).unwrap();
+        if !public
+            .set(scope, public_routing_key.into(), public_value.into())
+            .unwrap_or(false)
+        {
+            anyhow::bail!("could not register public class for {class_name}");
         }
     }
     Ok(())

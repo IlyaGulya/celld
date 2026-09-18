@@ -3,7 +3,7 @@ name: Cloudflare OS compatibility
 on:
   push:
     branches:
-      - agentos/cloudflare-os-compat
+      - agentos/cloudflare-os-v050
   workflow_dispatch:
 
 permissions:

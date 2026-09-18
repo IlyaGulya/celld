@@ -1292,7 +1292,11 @@ fn read_project(
     // Wrangler-shaped upload metadata, so a manifest written here and one
     // written by the control plane describe a deployment the same way.
     let mut bindings = Vec::new();
-    let mut do_classes = Vec::new();
+    // A SQLite migration declares the Durable Object class even when the
+    // Worker exposes it only through ctx.exports and has no env namespace
+    // binding. Cloudflare OS relies on this for AdminSettings and other
+    // internal classes.
+    let mut do_classes = sqlite_classes.clone();
     for binding in object
         .get("durable_objects")
         .and_then(|value| value.get("bindings"))
@@ -1308,7 +1312,9 @@ fn read_project(
             .get("class_name")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("durable object binding {name} has no `class_name`"))?;
-        do_classes.push(class_name.to_string());
+        if !do_classes.iter().any(|class| class == class_name) {
+            do_classes.push(class_name.to_string());
+        }
         bindings.push(json!({
             "type": "durable_object_namespace",
             "name": name,

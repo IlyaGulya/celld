@@ -1968,9 +1968,10 @@ class DurableObjectStorage {
   }
 }
 class DurableObjectId {
-  constructor(className, value, name = undefined) {
+  constructor(className, value, name = undefined, routingClass = className) {
     Object.defineProperties(this, {
       _className: { value: className },
+      _routingClass: { value: routingClass },
       _value: { value },
     });
     this.name = name;
@@ -1980,7 +1981,11 @@ class DurableObjectId {
   equals(other) {
     return other instanceof DurableObjectId && other._value === this._value;
   }
-  _scope() { return this._className + ":" + this._value; }
+  // The scope a cell is addressed by: the routing class, so two co-hosted
+  // scripts exporting the same public class name keep distinct cells.
+  _scope(routingClass = this._routingClass) {
+    return routingClass + ":" + this._value;
+  }
 }
 globalThis.DurableObjectRoutingError = class DurableObjectRoutingError
   extends Error {
@@ -2056,16 +2061,76 @@ const __durableClassMeta = new WeakMap();
 let __nextFacetOwner = 1;
 // Takes encoded props, not the caller's options bag: an options bag reaching
 // here is a bag nothing validated, and reading one key out of it is how every
-// other key came to be dropped in silence. The loader stub validates the bag
-// and encodes its value before it creates the class.
-const __makeDurableObjectClass = (idPromise, name, propsSc) => {
-  const value = {};
-  __durableClassMeta.set(value, {
-    idPromise,
+// other key came to be dropped in silence. The factory validates the bag and
+// encodes its value before it creates the class.
+//
+// The value is a Proxy, not a plain object: a DurableObjectClass is
+// capability-like metadata rather than cloneable data, and a plain object
+// would be projected into `{}` by the RPC walk before the lift could ever see
+// its brand. `sourceScript` names the owning script when the class is one of
+// the worker's own exports -- the stable identity cross-script RPC and durable
+// storage both need. An anonymous Worker Loader class has no script identity
+// and carries its local loader id in `transferId` instead.
+const __makeDurableObjectClass = (
+  idSource, name, propsSc, sourceScript = undefined,
+) => {
+  const value = new Proxy({}, {});
+  const idFactory = typeof idSource === "function" ? idSource : undefined;
+  const meta = {
+    idPromise: idFactory === undefined ? Promise.resolve(idSource) : undefined,
+    idFactory,
+    transferId: idFactory === undefined ? idSource : undefined,
+    sourceScript,
     name: name === null || name === undefined ? "default" : String(name),
     propsSc,
-  });
+  };
+  // An anonymous loader class resolves its id asynchronously; the resolved
+  // value is what a same-process transfer can carry.
+  if (meta.idPromise !== undefined)
+    meta.idPromise.then((id) => { meta.transferId = id; }, () => {});
+  __durableClassMeta.set(value, meta);
   return value;
+};
+// A service-backed class resolves its loader lazily: the class may cross
+// several RPC hops before anybody instantiates it as a facet, and each hop's
+// receiving isolate mints its own loader handle for the same script+class.
+const __durableClassLoaderId = (meta) => {
+  if (meta.idPromise === undefined) {
+    meta.idPromise = Promise.resolve(meta.idFactory());
+    meta.idFactory = undefined;
+  }
+  return meta.idPromise;
+};
+// The options bag of every props-bearing factory -- a Worker Loader entrypoint
+// or class, and a ctx.exports DurableObjectClass -- carries only `props`.
+// Workerd ignores an option it does not know; celld refuses it, because a
+// silently dropped option is exactly the defect getEntrypoint() had, and one
+// rule in one place is what stops the surfaces from drifting apart.
+const __propsOption = (what, options) => {
+  if (options === null || options === undefined) return undefined;
+  if (typeof options !== "object")
+    throw new TypeError(what + "() options must be an object.");
+  const extra = Object.keys(options).filter((key) => key !== "props");
+  if (extra.length !== 0)
+    throw new TypeError(
+      what + '() does not support the option "' + extra.join('", "') +
+      '". celld supports only "props".');
+  return options.props;
+};
+// `props` cross an isolate boundary by structured clone, on the same transport
+// that already carries a call's arguments. JSON is the obvious alternative and
+// it is wrong: JSON.stringify turns a Map, a Set, a Date, a typed array, and a
+// RegExp into a plain object or a string and reports no error, so the callee
+// reads a mangled value that the same call's arguments would have carried
+// intact. Encoding once, here, also rejects an unclonable value at the call
+// rather than at the first operation.
+const __propsSc = (what, options) => {
+  const props = __propsOption(what, options);
+  if (props === undefined) return undefined;
+  // `lift` false: the props cross an isolate boundary, so a stub inside them
+  // is a DataCloneError, exactly as a stub inside an argument of the same
+  // call is.
+  return __rpcOut(props, false);
 };
 class DurableObjectFacets {
   constructor(state) {
@@ -2108,7 +2173,7 @@ class DurableObjectFacets {
         if (meta === undefined)
           throw new TypeError(
             "FacetStartupOptions.class must be a DurableObjectClass.");
-        const loader = await meta.idPromise;
+        const loader = await __durableClassLoaderId(meta);
         const id = options.id instanceof DurableObjectId
           ? options.id.toString()
           : options.id === undefined ? this._state.id.toString() : String(options.id);
@@ -2511,10 +2576,11 @@ class DurableObjectState {
     const facet = __cell.facetConfigs[scope];
     this._facetDepth = facet?.depth ?? 0;
     const separator = scope.indexOf(":");
-    const className = separator < 0 ? scope : scope.slice(0, separator);
+    const routingClass = separator < 0 ? scope : scope.slice(0, separator);
+    const className = __cell.publicClassKeys[routingClass] ?? routingClass;
     const value = facet?.id ?? (separator < 0 ? scope : scope.slice(separator + 1));
     this.id = new DurableObjectId(
-      className, value, __cell.idNames[scope],
+      className, value, __cell.idNames[scope], routingClass,
     );
     this.props = facet?.props;
     // A class outside `containers` has no `ctx.container`, which is what
@@ -2790,7 +2856,8 @@ class DurableObjectState {
 function _instance(scope) {
   let inst = __cell.instances[scope];
   if (!inst) {
-    const className = scope.split(":")[0];
+    const routingClass = scope.split(":")[0];
+    const className = __cell.publicClassKeys[routingClass] ?? routingClass;
     const cls = __cell.classes[className];
     if (!cls) throw new Error("no DO class " + className);
     const state = new DurableObjectState(scope);
@@ -3119,39 +3186,6 @@ __celld.__makeLoader = () => {
   // `get(name, ...)` is memoized by name to one isolate; `load()` is anonymous.
   // A stub holds a Promise<id> so `getCode` may be async and load lazily.
   const byName = new Map();
-  // getEntrypoint() and getDurableObjectClass() take the same options bag, so
-  // one function reads it and returns the only option celld implements.
-  // Workerd ignores an option it does not know; celld refuses it, because a
-  // silently dropped option is exactly the defect getEntrypoint() had. Keeping
-  // the rule here rather than in each method is what stops the two from
-  // drifting apart again.
-  const loaderProps = (method, options) => {
-    if (options === null || options === undefined) return undefined;
-    if (typeof options !== "object")
-      throw new TypeError(method + "() options must be an object.");
-    const extra = Object.keys(options).filter((key) => key !== "props");
-    if (extra.length !== 0)
-      throw new TypeError(
-        method + '() does not support the option "' + extra.join('", "') +
-        '". celld supports only "props".');
-    return options.props;
-  };
-  // `props` cross to the loaded isolate by structured clone, on the same
-  // transport that already carries the call's arguments (`__rpcOut` below).
-  // JSON is the obvious alternative and it is wrong: JSON.stringify turns a
-  // Map, a Set, a Date, a typed array, and a RegExp into a plain object or a
-  // string and reports no error, so the callee reads a mangled value that the
-  // same call's arguments would have carried intact. Encoding here, once per
-  // loader API call, also rejects an unclonable value at that call rather than
-  // at the first operation.
-  const loaderPropsSc = (method, options) => {
-    const props = loaderProps(method, options);
-    if (props === undefined) return undefined;
-    // `lift` false: the props cross an isolate boundary, so a stub inside them
-    // is a DataCloneError, exactly as a stub inside an argument of the same
-    // call is.
-    return __rpcOut(props, false);
-  };
   const makeEntrypoint = (idPromise, entrypoint, propsSc) => {
     const target = {
       async fetch(input, init) {
@@ -3217,11 +3251,11 @@ __celld.__makeLoader = () => {
       getEntrypoint(name = null, options = {}) {
         return makeEntrypoint(
           idPromise, name === null ? "default" : String(name),
-          loaderPropsSc("getEntrypoint", options));
+          __propsSc("getEntrypoint", options));
       },
       getDurableObjectClass(name = null, options = {}) {
         return __makeDurableObjectClass(
-          idPromise, name, loaderPropsSc("getDurableObjectClass", options));
+          idPromise, name, __propsSc("getDurableObjectClass", options));
       },
       dispose: drop,
     };
@@ -3606,6 +3640,7 @@ const __rpcProject = (value) => {
     if (cached !== undefined) return cached;
     if (typeof v === "function" || v instanceof __cf.RpcTarget ||
         __stubMeta.has(v) || __svcMeta.has(v) || __doStubMeta.has(v) ||
+        __durableClassMeta.has(v) ||
         v instanceof Headers || v instanceof Blob || v instanceof Request ||
         v instanceof Response || v instanceof ReadableStream ||
         v instanceof WritableStream || v instanceof AbortSignal ||
@@ -4108,6 +4143,31 @@ const __stubLift = (value, allowCapabilities = true, originals) => {
       if (svc.props !== undefined) marker.p = lift(svc.props);
       return marker;
     }
+    // A DurableObjectClass is capability-like metadata: a class of this
+    // worker's own script crosses by script identity, an anonymous Worker
+    // Loader class by the local loader handle its identity already resolved
+    // to. Props cross as the structured-clone bytes the factory produced.
+    const durableClass = __durableClassMeta.get(v);
+    if (durableClass !== undefined) {
+      if (!allowCapabilities) return v;
+      lifted = true;
+      caps = true;
+      let marker;
+      if (durableClass.sourceScript !== undefined) {
+        marker = { "__celld$doClassSvc": durableClass.sourceScript,
+                   n: durableClass.name };
+      } else {
+        if (durableClass.transferId === undefined)
+          throw new DOMException(
+            "DurableObjectClass cannot cross RPC before its Worker Loader " +
+            "identity resolves.", "DataCloneError");
+        marker = { "__celld$doClass": durableClass.transferId,
+                   n: durableClass.name };
+      }
+      seen.set(v, marker);
+      if (durableClass.propsSc !== undefined) marker.p = durableClass.propsSc;
+      return marker;
+    }
     // Workerd refuses to serialize its promise/property handles.
     if (v instanceof __cf.RpcPromise || v instanceof __cf.RpcProperty)
       throw new DOMException(
@@ -4335,6 +4395,25 @@ const __stubRevive = (value) => {
       return v.t === __stubIsolate
         ? __entrypointStub(svcName, revive(v.p))
         : __foreignStub();
+    // A DurableObjectClass: a class of this script revives against the self
+    // loader, one of a co-hosted script against that script's loader minted
+    // here, and an anonymous Worker Loader class against the sender's local
+    // loader handle (same process only).
+    const classScript = v["__celld$doClassSvc"];
+    if (classScript !== undefined) {
+      const name = v.n === undefined ? "default" : String(v.n);
+      const propsSc = revive(v.p);
+      const idSource = classScript === __cell.script
+        ? () => __selfLoaderId ??= __loader_self()
+        : () => __serviceClassLoader(String(classScript), name);
+      return __makeDurableObjectClass(
+        idSource, name, propsSc, String(classScript));
+    }
+    const classLoader = v["__celld$doClass"];
+    if (classLoader !== undefined)
+      return __makeDurableObjectClass(
+        Promise.resolve(Number(classLoader)),
+        v.n === undefined ? "default" : String(v.n), revive(v.p));
     const doClass = v["__celld$do"];
     if (doClass !== undefined) {
       const namespace = __cell.makeNamespace(doClass);
@@ -4824,10 +4903,47 @@ const __unwrapStoredMap = (v) => {
     map.set(key, __unwrapStored(value));
   return map;
 };
-// ctx.exports: loopback stubs for every exported entrypoint plus
-// this worker's Durable Object namespaces. Built once, on first
-// access -- ctx construction itself only carries the getter.
+// ctx.exports: loopback stubs for every exported entrypoint, plus callable
+// DurableObjectClass factories for this worker's own Durable Object classes.
+// Workerd's `ctx.exports.SomeDurableObject({ props })` returns a class
+// descriptor for ctx.facets.get(); the namespace methods stay on the factory
+// itself, and an env binding remains a DurableObjectNamespace.
+// Built once, on first access -- ctx construction itself only carries the
+// getter.
 let __ctxExportsCache;
+let __selfLoaderId;
+// This deployment's own WorkerConfig, registered as a loader: a facet of one
+// of the worker's own classes runs in a loaded isolate of the same config,
+// reusing the facet storage and fencing path rather than a second one.
+const __selfDurableObjectClass = (name) => {
+  const namespace = () => __cell.makeNamespace(name);
+  const cls = (options = {}) => {
+    const loader = __selfLoaderId ??= __loader_self();
+    return __makeDurableObjectClass(
+      Promise.resolve(loader), name, __propsSc(name, options), __cell.script);
+  };
+  for (const method of [
+    "idFromName", "idFromString", "newUniqueId", "jurisdiction", "getByName", "get",
+  ]) {
+    Object.defineProperty(cls, method, {
+      value: (...args) => namespace()[method](...args),
+    });
+  }
+  return cls;
+};
+// A DurableObjectClass of a co-hosted service script resolves to a loader of
+// that script, minted by the receiving isolate: the class's wire identity is
+// script + class, never a handle from the sender's process.
+const __serviceClassLoaderCache = new Map();
+const __serviceClassLoader = (script, name) => {
+  const key = script + "\u0000" + name;
+  let loader = __serviceClassLoaderCache.get(key);
+  if (loader === undefined) {
+    loader = Promise.resolve(__service_class_loader(script, name)).then(Number);
+    __serviceClassLoaderCache.set(key, loader);
+  }
+  return loader;
+};
 const __ctxExports = () => __ctxExportsCache ??= (() => {
   const out = {};
   for (const name of Object.keys(__cell.entrypoints))
@@ -4835,8 +4951,11 @@ const __ctxExports = () => __ctxExportsCache ??= (() => {
   for (const name of Object.keys(__cell.objectEntrypoints))
     if (name !== "default")
       out[name] = __entrypointStub(name, undefined);
-  for (const name of Object.keys(__cell.namespaceKeys))
-    out[name] = __cell.makeNamespace(name);
+  // A `.`-prefixed or `__`-prefixed key is a runtime-owned class, never a
+  // module export the application can name.
+  for (const name of Object.keys(__cell.doExports))
+    if (!name.startsWith("__") && name !== ".cron")
+      out[name] = __selfDurableObjectClass(name);
   return out;
 })();
 // ---- RPC envelope ----------------------------------------------
@@ -4963,24 +5082,28 @@ function makeNamespace(className) {
   const namespaceKey = __cell.namespaceKeys[className];
   if (typeof namespaceKey !== "string")
     throw new Error("no Durable Object namespace key for " + className);
-  return new DurableObjectNamespace(className, namespaceKey);
+  const routingClass = __cell.routingClassKeys[className] ?? className;
+  return new DurableObjectNamespace(className, namespaceKey, routingClass);
 }
 // A named class: SDKs sniff bindings by constructor name (workers-rs
 // EnvBinding requires `constructor.name === "DurableObjectNamespace"`).
 class DurableObjectNamespace {
-  constructor(className, namespaceKey) {
+  constructor(className, namespaceKey, routingClass = className) {
     Object.defineProperty(this, "_className", { value: className });
     Object.defineProperty(this, "_namespaceKey", { value: namespaceKey });
+    Object.defineProperty(this, "_routingClass", { value: routingClass });
   }
   idFromName(name) {
     name = String(name);
     return new DurableObjectId(
       this._className, __do_id(this._namespaceKey, "name", name), name,
+      this._routingClass,
     );
   }
   idFromString(value) {
     return new DurableObjectId(
       this._className, __do_id(this._namespaceKey, "validate", String(value)),
+      undefined, this._routingClass,
     );
   }
   newUniqueId(options = {}) {
@@ -4989,6 +5112,7 @@ class DurableObjectNamespace {
       throw new Error("Jurisdiction restrictions are not implemented");
     return new DurableObjectId(
       this._className, __do_id(this._namespaceKey, "unique", ""),
+      undefined, this._routingClass,
     );
   }
   jurisdiction(value) {
@@ -5002,7 +5126,7 @@ class DurableObjectNamespace {
     const className = this._className;
     if (!(id instanceof DurableObjectId) || id._className !== className)
       throw new TypeError("Durable Object ID is not valid for this namespace");
-    const scope = id._scope();
+    const scope = id._scope(this._routingClass);
     // Emulate production: the actor recovers its name only when it is
     // <= 1024 UTF-8 bytes; longer names are dropped so ctx.id.name is
     // undefined. The full name still seeds the routing hash, so
@@ -5835,6 +5959,8 @@ const __cell = __celld.__cell = {
   env: {},
   idNames: {},
   namespaceKeys: {},
+  routingClassKeys: {},
+  publicClassKeys: {},
   node: "",
   deleteAllDeletesAlarm: false,
   compat: { jsRpc: false, fetcherGetPutDelete: false, queueJsonMessages: false },
