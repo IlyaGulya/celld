@@ -4292,6 +4292,10 @@ const __stubLift = (value, transport = true, originals) => {
       // A stub belongs to the request that received it; another
       // request cannot serialize it (Workerd's IoContext rule).
       if (meta.ctx !== ctx) throw __ctxError("Client");
+      // A capability this request adopted moves to the receiver, so the
+      // origin handle follows the stub instead of retiring with this request.
+      if (meta.entry.bridge !== undefined)
+        __rpc_bridge_transfer(meta.entry.bridge);
       meta.disposed = true; // the ref moves to the receiver
       __ctxUnregister(meta);
       const marker = meta.entry.bridge !== undefined
@@ -4579,6 +4583,9 @@ const __stubRevive = (value) => {
     if (v === null || typeof v !== "object") return v;
     const bridgeId = v["__celld$bridge"];
     if (bridgeId !== undefined) {
+      // The capability belongs to this request now: if nothing disposes the
+      // stub, request retirement releases the origin-side handle.
+      __rpc_bridge_adopt(bridgeId);
       const entry = { bridge: bridgeId, refs: 1 };
       const stub = __makeStub(entry, v.c);
       const meta = __stubMeta.get(stub);

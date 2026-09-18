@@ -2533,7 +2533,9 @@ fn encode_rpc_bridge_peer_body(call: &RpcBridgeRemoteReq) -> anyhow::Result<Vec<
     Ok(body)
 }
 
-fn decode_rpc_bridge_peer_body(body: &[u8]) -> anyhow::Result<(RpcBridgePeerMeta, Option<Vec<u8>>)> {
+fn decode_rpc_bridge_peer_body(
+    body: &[u8],
+) -> anyhow::Result<(RpcBridgePeerMeta, Option<Vec<u8>>)> {
     anyhow::ensure!(body.len() >= 4, "RPC bridge peer body is truncated");
     let meta_len = u32::from_be_bytes(body[..4].try_into().unwrap()) as usize;
     anyhow::ensure!(
@@ -4367,6 +4369,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     });
     // A transient capability is valid for this exact process lifetime; a
     // restarted process with the same node name must not resolve the handle.
+    celld::js::set_rpc_bridge_process_node(node.clone());
     celld::js::set_rpc_bridge_process_generation(process_generation.clone());
     let app = AppHandle {
         tx,

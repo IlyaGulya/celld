@@ -1720,6 +1720,8 @@ impl AppHandle {
                     .map(|(cell, generation)| (cell, serde_json::Value::from(generation)))
                     .collect::<serde_json::Map<_, _>>(),
             });
+            state["rpc_bridge_handles"] =
+                serde_json::Value::from(crate::js::rpc_bridge_registry_len() as u64);
         }
         state.to_string()
     }

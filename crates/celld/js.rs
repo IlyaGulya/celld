@@ -8543,6 +8543,8 @@ ops! { OP_NAMES, install_op_functions,
         "__loader_rpc" => op_loader_rpc,
         "__loader_drop" => op_loader_drop,
         "__rpc_bridge_export" => op_rpc_bridge_export,
+        "__rpc_bridge_adopt" => op_rpc_bridge_adopt,
+        "__rpc_bridge_transfer" => op_rpc_bridge_transfer,
         "__rpc_bridge_call" => op_rpc_bridge_call,
         "__rpc_bridge_drop" => op_rpc_bridge_drop,
         "__facet_fetch" => op_facet_fetch,
@@ -9446,6 +9448,7 @@ pub struct RpcBridgeRemoteReq {
 static RPC_BRIDGE_REMOTE_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<RpcBridgeRemoteReq>> =
     OnceLock::new();
 static RPC_BRIDGE_PROCESS_GENERATION: OnceLock<String> = OnceLock::new();
+static RPC_BRIDGE_PROCESS_NODE: OnceLock<String> = OnceLock::new();
 
 #[doc(hidden)]
 pub fn set_service_class_loader_tx(tx: tokio::sync::mpsc::UnboundedSender<ServiceClassLoaderReq>) {
@@ -9465,6 +9468,13 @@ pub fn set_rpc_bridge_process_generation(generation: String) {
     let _ = RPC_BRIDGE_PROCESS_GENERATION.set(generation);
 }
 
+/// This process's node name, installed at startup so a bridge can tell a local
+/// reference from a peer's without an isolate.
+#[doc(hidden)]
+pub fn set_rpc_bridge_process_node(node: String) {
+    let _ = RPC_BRIDGE_PROCESS_NODE.set(node);
+}
+
 fn rpc_bridge_process_generation() -> &'static str {
     RPC_BRIDGE_PROCESS_GENERATION
         .get()
@@ -9472,7 +9482,12 @@ fn rpc_bridge_process_generation() -> &'static str {
         .unwrap_or("")
 }
 
-
+fn rpc_bridge_process_node() -> &'static str {
+    RPC_BRIDGE_PROCESS_NODE
+        .get()
+        .map(String::as_str)
+        .unwrap_or("")
+}
 
 /// This isolate's own `WorkerConfig`, registered as a loader once per isolate.
 /// A facet of one of the worker's own Durable Object classes runs in a loaded
@@ -9527,6 +9542,12 @@ fn rpc_bridge_registry() -> &'static Mutex<RpcBridgeRegistry> {
     RPC_BRIDGE_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Number of live transient RPC bridge handles in this process. Exposed in
+/// the operator `/state` snapshot so soak tests can distinguish allocator
+/// high-water from a capability-lifecycle leak without inspecting payloads.
+pub fn rpc_bridge_registry_len() -> usize {
+    rpc_bridge_registry().lock().unwrap().len()
+}
 
 /// The wire identity of a transient capability: the node that minted it, that
 /// node's process generation, and a process-local opaque id. A restarted
@@ -9591,6 +9612,44 @@ pub async fn rpc_bridge_invoke_local(
             Ok(()) => Err(anyhow::anyhow!("RPC bridge dropped its result")),
         },
     }
+}
+
+/// Release one bridge handle, wherever its origin lives. Used when a request
+/// context that adopted a capability retires: the receiving request is gone,
+/// so the origin's handle must be released without a JS Symbol.dispose.
+fn schedule_rpc_bridge_drop(reference: RpcBridgeRef) {
+    let local_node = rpc_bridge_process_node().to_string();
+    let local_generation = rpc_bridge_process_generation().to_string();
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    handle.spawn(async move {
+        if local_node.is_empty() || reference.node == local_node {
+            if reference.generation == local_generation {
+                let _ = rpc_bridge_invoke_local(reference.id, Vec::new(), None, true).await;
+            }
+            return;
+        }
+        let Some(sender) = RPC_BRIDGE_REMOTE_TX.get() else {
+            return;
+        };
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        if sender
+            .send(RpcBridgeRemoteReq {
+                origin_node: reference.node,
+                origin_generation: reference.generation,
+                bridge_id: reference.id,
+                path: Vec::new(),
+                args: None,
+                drop_handle: true,
+                reply,
+            })
+            .is_err()
+        {
+            return;
+        }
+        let _ = receive.await;
+    });
 }
 
 /// Remove the registry references for every child of `owner`. The caller
@@ -10272,6 +10331,47 @@ fn op_rpc_bridge_export(
 
 /// `__rpc_bridge_call(bridgeId, pathJson, argsSc)` -> Promise<Uint8Array>. Runs
 /// one op on the origin isolate's V8 handle through a fresh event there.
+/// `__rpc_bridge_adopt(handle)`: this request now holds the capability, so
+/// request retirement is what releases it if nothing else does.
+fn op_rpc_bridge_adopt(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let reference = match parse_rpc_bridge_ref(&args.get(0).to_rust_string_lossy(scope)) {
+        Ok(reference) => reference,
+        Err(error) => return loader_throw(scope, &error),
+    };
+    let Some(context) = installed_context() else {
+        return loader_throw(scope, "RPC bridge: no current request context");
+    };
+    context.adopt_rpc_bridge(reference);
+}
+
+/// `__rpc_bridge_transfer(handle)`: the stub is moving to another request, so
+/// this request stops owning the release.
+fn op_rpc_bridge_transfer(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let reference = match parse_rpc_bridge_ref(&args.get(0).to_rust_string_lossy(scope)) {
+        Ok(reference) => reference,
+        Err(error) => return loader_throw(scope, &error),
+    };
+    let Some(context) = installed_context() else {
+        return loader_throw(scope, "RPC bridge: no current request context");
+    };
+    if !context.transfer_rpc_bridge(&reference) {
+        loader_throw(
+            scope,
+            "Cannot perform I/O on behalf of a different request. I/O objects (such as \
+streams, request/response bodies, and RPC stubs) created in the context of one request \
+handler cannot be accessed from a different request's handler.",
+        );
+    }
+}
+
 fn op_rpc_bridge_call(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -10331,38 +10431,13 @@ fn op_rpc_bridge_drop(
     let Ok(reference) = parse_rpc_bridge_ref(&args.get(0).to_rust_string_lossy(scope)) else {
         return;
     };
-    let local_node = current_node(scope);
-    let local_generation = rpc_bridge_process_generation().to_string();
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        return;
-    };
-    handle.spawn(async move {
-        if reference.node == local_node {
-            if reference.generation == local_generation {
-                let _ = rpc_bridge_invoke_local(reference.id, Vec::new(), None, true).await;
-            }
-            return;
-        }
-        let (reply, receive) = tokio::sync::oneshot::channel();
-        let Some(sender) = RPC_BRIDGE_REMOTE_TX.get() else {
-            return;
-        };
-        if sender
-            .send(RpcBridgeRemoteReq {
-                origin_node: reference.node,
-                origin_generation: reference.generation,
-                bridge_id: reference.id,
-                path: Vec::new(),
-                args: None,
-                drop_handle: true,
-                reply,
-            })
-            .is_err()
-        {
-            return;
-        }
-        let _ = receive.await;
-    });
+    // Explicit disposal consumes this request's adopted reference; the release
+    // itself is idempotent, so a path that also retires the context cannot
+    // double-drop.
+    if let Some(context) = installed_context() {
+        context.transfer_rpc_bridge(&reference);
+    }
+    schedule_rpc_bridge_drop(reference);
 }
 
 /// `__loader_rpc(id, entrypoint, method, argsSc, propsSc)` ->
@@ -13508,6 +13583,10 @@ pub struct IoContext {
     /// Empty for stateless Worker code, which owns no cell and gates
     /// nothing.
     egress: Mutex<Vec<EgressFrame>>,
+    /// Transient fleet RPC capabilities adopted while this request is current.
+    /// Moving a stub through another RPC removes it here; request retirement
+    /// drops anything still held and releases the origin-side bridge handle.
+    rpc_bridges: Mutex<HashSet<RpcBridgeRef>>,
     /// Ops another event's turn enqueued for this event, waiting for this
     /// event's driver to take them. See `adopt`: a continuation that resumes
     /// inside a foreign turn still enqueues through that turn, and only the
@@ -13564,6 +13643,7 @@ impl IoContext {
             body_streams: Mutex::new(HashMap::new()),
             ws_capture: Mutex::new(Vec::new()),
             egress: Mutex::new(Vec::new()),
+            rpc_bridges: Mutex::new(HashSet::new()),
             handed: Mutex::new(Some(Vec::new())),
             handed_len: AtomicUsize::new(0),
             handed_wake: tokio::sync::Notify::new(),
@@ -13586,6 +13666,7 @@ impl IoContext {
             body_streams: Mutex::new(HashMap::new()),
             ws_capture: Mutex::new(Vec::new()),
             egress: Mutex::new(Vec::new()),
+            rpc_bridges: Mutex::new(HashSet::new()),
             handed: Mutex::new(Some(Vec::new())),
             handed_len: AtomicUsize::new(0),
             handed_wake: tokio::sync::Notify::new(),
@@ -13688,6 +13769,14 @@ impl IoContext {
         let mut handed = self.handed.lock().unwrap();
         self.handed_len.store(0, Ordering::Release);
         handed.take().unwrap_or_default()
+    }
+
+    fn adopt_rpc_bridge(&self, reference: RpcBridgeRef) {
+        self.rpc_bridges.lock().unwrap().insert(reference);
+    }
+
+    fn transfer_rpc_bridge(&self, reference: &RpcBridgeRef) -> bool {
+        self.rpc_bridges.lock().unwrap().remove(reference)
     }
 
     fn begin_event(&self) {
@@ -13964,6 +14053,18 @@ impl Drop for IoContext {
         // can leave a process-wide input gate active after it is gone.
         let _ = abandon_context_input_gates(self);
         self.close_sockets();
+        // A request that ends still holding an adopted capability releases the
+        // origin's handle, so a caller that never disposes the stub cannot
+        // leak the handling node's bridge.
+        let bridge_refs = self
+            .rpc_bridges
+            .get_mut()
+            .unwrap()
+            .drain()
+            .collect::<Vec<_>>();
+        for reference in bridge_refs {
+            schedule_rpc_bridge_drop(reference);
+        }
         let mut claims = self
             .body_streams
             .get_mut()
@@ -14057,7 +14158,6 @@ fn current_context() -> Arc<IoContext> {
     })
 }
 
-#[cfg(celld_internal_tests)]
 fn installed_context() -> Option<Arc<IoContext>> {
     CURRENT.with(|current| current.borrow().clone())
 }
