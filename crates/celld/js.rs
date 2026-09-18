@@ -10297,8 +10297,10 @@ impl Drop for RequestBodyGuard {
     }
 }
 
-/// `__rpc_bridge_export(stubId)` -> bridge handle. Mints a process-local name
-/// for one local stub entry so another isolate can invoke it.
+/// `__rpc_bridge_export(stubId)` -> bridge handle. Mints the wire identity of
+/// one local stub entry -- origin node, process generation, and a
+/// process-local opaque id -- so any isolate or node can invoke it, and a
+/// restarted process cannot alias the handle.
 fn op_rpc_bridge_export(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -10329,8 +10331,9 @@ fn op_rpc_bridge_export(
     rv.set(v8::String::new(scope, &encoded).unwrap().into());
 }
 
-/// `__rpc_bridge_call(bridgeId, pathJson, argsSc)` -> Promise<Uint8Array>. Runs
-/// one op on the origin isolate's V8 handle through a fresh event there.
+/// `__rpc_bridge_call(handle, pathJson, argsSc)` -> Promise<Uint8Array>. Runs
+/// one op on the origin isolate's V8 handle through a fresh event there: in
+/// this process when the handle names it, otherwise over `/peer/rpc-bridge`.
 /// `__rpc_bridge_adopt(handle)`: this request now holds the capability, so
 /// request retirement is what releases it if nothing else does.
 fn op_rpc_bridge_adopt(
