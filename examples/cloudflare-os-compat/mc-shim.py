@@ -218,7 +218,7 @@ def main(argv):
         keys = list_objects(source_client, source_bucket, source_prefix)
         if not keys:
             raise SystemExit(f"mc-shim: mirror source {source} is empty")
-        for key in keys:
+        for key, _ in keys:
             relative = (
                 key[len(source_prefix):] if key.startswith(source_prefix) else key
             )
