@@ -1355,6 +1355,11 @@ fn read_project(
         if let Some(entrypoint) = entrypoint {
             encoded["entrypoint"] = json!(entrypoint);
         }
+        // Wrangler's per-binding `props` become the target entrypoint's
+        // ctx.props, the same value a ctx.exports ServiceStub carries.
+        if let Some(props) = service.get("props") {
+            encoded["props"] = props.clone();
+        }
         bindings.push(encoded);
         service_count += 1;
     }

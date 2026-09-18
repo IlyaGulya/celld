@@ -4097,9 +4097,10 @@ pub struct WorkerConfig {
     /// The worker's non-main modules, so the main module can import siblings.
     modules: Vec<(String, ModuleSource)>,
     compat: Compat,
-    /// `[[services]]`: (binding name, target script, optional entrypoint).
-    /// The target runs in this process; see [[service-bindings]].
-    services: Vec<(String, String, Option<String>)>,
+    /// `[[services]]`: binding name, target script, optional entrypoint, and
+    /// the props that entrypoint's ctx carries. The target runs in this
+    /// process; see [[service-bindings]].
+    services: Vec<crate::fleet::ServiceBinding>,
     asset_binding: Option<String>,
     /// `env` names of the Worker Loader bindings, if this Worker can spawn
     /// dynamic isolates. A config can declare more than one loader, and each
@@ -4321,7 +4322,7 @@ impl WorkerConfig {
     }
 
     /// Declare the service bindings this Worker may call.
-    pub fn with_services(mut self, services: Vec<(String, String, Option<String>)>) -> Self {
+    pub fn with_services(mut self, services: Vec<crate::fleet::ServiceBinding>) -> Self {
         self.services = services;
         self
     }

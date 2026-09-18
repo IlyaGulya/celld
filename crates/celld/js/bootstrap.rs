@@ -749,14 +749,35 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
                 binding.environment, binding.workflow
             ));
         }
-        for (binding, script, entrypoint) in services {
+        for service in services {
+            let crate::fleet::ServiceBinding {
+                name: binding,
+                script,
+                entrypoint,
+                props,
+            } = service;
             let entrypoint = match entrypoint {
                 Some(name) => format!("{name:?}"),
                 None => "null".to_string(),
             };
+            // The declared props are a binding property, so they are encoded
+            // here, in the isolate that will carry them, on the same
+            // structured-clone transport as ctx.exports props. The JSON
+            // literal is escaped for the two characters that could end the
+            // snippet it is embedded in.
+            let props = match props {
+                Some(value) => format!(
+                    ", __celld.__sc_encode({})",
+                    value
+                        .to_string()
+                        .replace('\u{2028}', "\\u2028")
+                        .replace('\u{2029}', "\\u2029")
+                ),
+                None => String::new(),
+            };
             lines.push_str(&format!(
-                "e[{:?}] = __celld.__makeServiceBinding({:?}, {});\n",
-                binding, script, entrypoint
+                "e[{:?}] = __celld.__makeServiceBinding({:?}, {}{});\n",
+                binding, script, entrypoint, props
             ));
         }
         for (name, value) in vars {

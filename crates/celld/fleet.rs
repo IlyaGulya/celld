@@ -960,6 +960,17 @@ async fn load_worker_at_pointer(
     })
 }
 
+/// One `services` binding: the env name, the target script, the optional
+/// named entrypoint, and the `props` object Wrangler carries for it. The props
+/// become that entrypoint's `ctx.props`.
+#[derive(Clone, Debug)]
+pub struct ServiceBinding {
+    pub name: String,
+    pub script: String,
+    pub entrypoint: Option<String>,
+    pub props: Option<serde_json::Value>,
+}
+
 pub struct LoadedDeployment {
     pub options: WorkerConfigOptions,
     pub script_name: String,
@@ -971,7 +982,7 @@ pub struct LoadedDeployment {
     /// declare, and each loader keeps a cache of its own loaded Workers.
     pub loader_bindings: Vec<String>,
     pub assets: Option<crate::assets::AssetResolver>,
-    pub services: Vec<(String, String, Option<String>)>,
+    pub services: Vec<ServiceBinding>,
     /// `triggers.crons` from the manifest, driving the reserved cron cell.
     pub crons: Vec<String>,
     /// `containers` from the manifest: the classes whose cells supervise a
@@ -996,17 +1007,18 @@ fn bindings<'a>(
         })
 }
 
-fn service_bindings(manifest: &Manifest) -> Vec<(String, String, Option<String>)> {
+fn service_bindings(manifest: &Manifest) -> Vec<ServiceBinding> {
     bindings(manifest, "service")
         .filter_map(|binding| {
-            Some((
-                binding.get("name")?.as_str()?.to_string(),
-                binding.get("service")?.as_str()?.to_string(),
-                binding
+            Some(ServiceBinding {
+                name: binding.get("name")?.as_str()?.to_string(),
+                script: binding.get("service")?.as_str()?.to_string(),
+                entrypoint: binding
                     .get("entrypoint")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string),
-            ))
+                props: binding.get("props").cloned(),
+            })
         })
         .collect()
 }

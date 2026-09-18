@@ -260,7 +260,7 @@ fn dependencies_of(loaded: &LoadedDeployment) -> VecDeque<Dependency> {
     loaded
         .services
         .iter()
-        .map(|(_, script, _)| Dependency::Service(script.clone()))
+        .map(|service| Dependency::Service(service.script.clone()))
         .chain(queues.into_iter().map(Dependency::Queue))
         .collect()
 }
