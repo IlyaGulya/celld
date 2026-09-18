@@ -2682,11 +2682,23 @@ fn encode_http_response(
         "headers": response.headers,
     });
     if ws_target {
-        let target = match response.websocket.as_ref() {
-            Some(HttpResponseWebSocket::Cell(target)) => Some(target),
-            _ => None,
-        };
-        obj["wsTarget"] = serde_json::json!(target);
+        match response.websocket.take() {
+            Some(HttpResponseWebSocket::Cell(target)) => {
+                obj["wsTarget"] = serde_json::json!(target);
+            }
+            Some(HttpResponseWebSocket::Worker(worker)) => {
+                // A service-binding 101 from a stateless Worker stays entirely
+                // process-local. Put its frame channel back in the handoff
+                // registry and send only the opaque id through the caller
+                // isolate; if that caller returns the Response,
+                // `__readResponse` transfers the exact same socket to the
+                // external client.
+                obj["workerSocketId"] = serde_json::json!(worker.repark());
+            }
+            None => {
+                obj["wsTarget"] = serde_json::Value::Null;
+            }
+        }
     }
     if let Some(stream) = response.stream.take() {
         let Some(stream_id) = stream_service.register_source(HttpStreamSource::Stream(stream))

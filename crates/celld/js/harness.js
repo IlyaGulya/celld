@@ -281,6 +281,10 @@ globalThis.Response = class Response {
       this.headers.set("content-type", typed.type);
     this.webSocket = init.webSocket ?? null;
     this._wsTarget = init.__wsTarget || init._wsTarget || null;
+    // A 101 answered by a service-binding target stays in the answering
+    // isolate as a host frame channel; the id is what lets a caller that
+    // returns the Response hand that exact socket to its own client.
+    this._workerSocketId = Number(init.__workerSocketId || 0);
     this.ok = this.status >= 200 && this.status <= 299;
     this.redirected = false;
     this.type = "default";
@@ -358,7 +362,8 @@ globalThis.Response = class Response {
       this.body === null ? null : this._bodyBytes,
       {
         status: this.status, statusText: this.statusText, headers: this.headers,
-        webSocket: this.webSocket, __wsTarget: this._wsTarget, cf: this.cf,
+        webSocket: this.webSocket, __wsTarget: this._wsTarget,
+        __workerSocketId: this._workerSocketId, cf: this.cf,
       },
     );
     response.type = this.type;
@@ -3130,6 +3135,7 @@ const __wrapServiceResponse = (res, url) => {
       headers: res.headers,
       webSocket: res.webSocket || bound,
       __wsTarget: res._wsTarget,
+      __workerSocketId: res._workerSocketId,
     },
   );
   // The constructor copies headers, so mark the copy.
@@ -3605,6 +3611,7 @@ const __makeServiceBinding = __celld.__makeServiceBinding =
     return __finishServiceFetch(
       new Response(responseBody, {
         status: r.status, headers: r.headers, __wsTarget: r.wsTarget,
+        __workerSocketId: r.workerSocketId,
       }),
       req, redirectState);
   },
@@ -12975,9 +12982,12 @@ __celld.__readResponse = (r) => {
   // only a generic invalid status instead of the Worker contract failure.
   if (r.type === "error" || r.status === 0)
     return { error: __ERROR_RESPONSE_MESSAGE };
-  let workerSocketId = 0;
+  // An id already on the Response names a socket in the isolate that answered
+  // a service binding: this isolate holds no socket to mint, and the client
+  // end joins that target when the host performs the upgrade.
+  let workerSocketId = Number(r._workerSocketId || 0);
   let wsTarget = r._wsTarget || (r.webSocket && r.webSocket._target) || null;
-  if (r.status === 101 && r.webSocket && wsTarget === null) {
+  if (workerSocketId === 0 && r.status === 101 && r.webSocket && wsTarget === null) {
     const server = r.webSocket._peer;
     if (server && server._accepted) {
       workerSocketId = server._id;
