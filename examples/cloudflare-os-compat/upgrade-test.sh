@@ -77,27 +77,21 @@ wait_ready() {
   return 1
 }
 
-# A v0.5.0 node refuses to boot while any live lease is in the bucket, because
-# the version it replaces cannot honour the format migration lock. The refusal
-# is the mixed-version gate now: it is stronger than a per-request protocol
-# rejection, and it is what an operator sees when a fleet is not stopped.
-expect_refusal() {
-  local log="$1" pid="$2" reason="$3"
+# Wait for the new node to either serve or exit, and report which happened.
+wait_state() {
+  local port="$1" pid="$2"
   for _ in $(seq 1 120); do
+    if curl -fsS "http://127.0.0.1:$port/.well-known/celld/health" >/dev/null 2>&1; then
+      echo ready
+      return 0
+    fi
     if ! kill -0 "$pid" >/dev/null 2>&1; then
-      wait "$pid" >/dev/null 2>&1 || true
-      grep -q "$reason" "$log" || {
-        echo "node refused to start without the documented reason:" >&2
-        cat "$log" >&2
-        return 1
-      }
+      echo exited
       return 0
     fi
     sleep 0.25
   done
-  echo "node kept running although the quiet-fleet precondition was unmet" >&2
-  cat "$log" >&2
-  return 1
+  echo timeout
 }
 
 PID_OLD="$(start_node "$OLD_BIN" "$OLD_NODE" "$TMP/old" "$PORT_OLD" "$PEER_OLD" "$TMP/old.log")"
@@ -106,9 +100,38 @@ prime="$(curl -fsS "http://127.0.0.1:$PORT_OLD/prime")"
 [[ "$prime" == *'"value":3'* ]] || { echo "unexpected old-owner prime response: $prime" >&2; exit 1; }
 
 PID_NEW="$(start_node "$NEW_BIN" "$NEW_NODE" "$TMP/new" "$PORT_NEW" "$PEER_NEW" "$TMP/new.log")"
-expect_refusal "$TMP/new.log" "$PID_NEW" "is still live"
-printf 'PASS %-32s %s\n' "live-lease boot refusal" \
-  "new node refused to start while the old lease was live"
+# Which refusal the mixed fleet gets depends on the bucket the old node left:
+#  - its format needs migrating, so `wake_format::ensure_stopped` refuses the
+#    boot outright while an old lease is live; or
+#  - the bucket is already at the current format, the node serves, and the
+#    per-request peer protocol check is what fails closed.
+state="$(wait_state "$PORT_NEW" "$PID_NEW")"
+case "$state" in
+  exited)
+    grep -q "is still live" "$TMP/new.log" || {
+      echo "the new node exited without the quiet-fleet reason:" >&2
+      cat "$TMP/new.log" >&2
+      exit 1
+    }
+    printf 'PASS %-32s %s\n' "quiet-fleet boot refusal" \
+      "refused to start while the old lease was live"
+    ;;
+  ready)
+    mixed_body="$TMP/mixed.body"
+    mixed_status="$(curl --max-time 15 -sS -o "$mixed_body" -w '%{http_code}' "http://127.0.0.1:$PORT_NEW/get" || true)"
+    mixed="$(cat "$mixed_body" 2>/dev/null || true)"
+    if [[ "$mixed_status" == "200" || "$mixed" != *"PeerIncompatible"* ]]; then
+      echo "mixed peer protocol did not fail closed: HTTP $mixed_status $mixed" >&2
+      exit 1
+    fi
+    printf 'PASS %-32s HTTP %s %s\n' "mixed peer protocol refusal" "$mixed_status" "$mixed"
+    ;;
+  *)
+    echo "the new node neither served nor exited" >&2
+    cat "$TMP/new.log" >&2
+    exit 1
+    ;;
+esac
 
 kill -9 "$PID_OLD" >/dev/null 2>&1 || true
 wait "$PID_OLD" >/dev/null 2>&1 || true
