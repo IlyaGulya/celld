@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - agentos/cloudflare-os-phase0-runtime
-      - agentos/cloudflare-os-v050
   workflow_dispatch:
 
 permissions:
