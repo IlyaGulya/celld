@@ -112,7 +112,7 @@ jobs:
           CELLD_BACKUP_SOURCE="s3://agentos-phase0/${{ github.run_id }}/backup-source" \
           CELLD_BACKUP_RESTORE="s3://agentos-phase0/${{ github.run_id }}/backup-restore" \
           CELLD_BACKUP_ENDPOINT="$S3_ENDPOINT" \
-          CELLD_MC="python3 $PWD/examples/cloudflare-os-compat/mc-shim.py" \
+          CELLD_MC="$PWD/examples/cloudflare-os-compat/mc-shim.py" \
             bash examples/cloudflare-os-compat/restore-test.sh "$PWD/target/debug/celld"
 
       # Both shapes of the stop-the-fleet contract: the pre-v0.5.0 runtime
