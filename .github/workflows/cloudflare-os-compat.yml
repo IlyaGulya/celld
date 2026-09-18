@@ -125,7 +125,9 @@ jobs:
           set -euo pipefail
           # Each variant gets its own ports and prefix: the first run's nodes are
           # signalled at exit, and their listeners are not guaranteed to be gone
-          # by the time the second run binds the same numbers.
+          # by the time the second run starts. The offset clears the whole block
+          # a variant uses (worker and peer ports are interleaved, 71/72 and
+          # 81/82), so a small step would collide.
           offset=0
           for ref in agentos-pre-v050-runtime v0.5.0; do
             slug="$(echo "$ref" | tr '/.' '--')"
@@ -138,5 +140,5 @@ jobs:
             CELLD_UPGRADE_PEER_NEW=$((19982 + offset)) \
               bash examples/cloudflare-os-compat/upgrade-test.sh \
                 "$worktree/target/debug/celld" "$PWD/target/debug/celld"
-            offset=$((offset + 10))
+            offset=$((offset + 100))
           done
