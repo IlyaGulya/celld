@@ -1,0 +1,9 @@
+{
+  "name": "cloudflare-os-upgrade-protocol",
+  "main": "upgrade-worker.js",
+  "compatibility_date": "2026-02-02",
+  "durable_objects": {
+    "bindings": [{ "name": "UPGRADE_COUNTER", "class_name": "UpgradeCounter" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["UpgradeCounter"] }]
+}

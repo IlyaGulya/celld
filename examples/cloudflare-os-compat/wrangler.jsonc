@@ -1,0 +1,31 @@
+{
+  "name": "cloudflare-os-compat",
+  "main": "index.js",
+  "compatibility_date": "2026-09-07",
+  "compatibility_flags": ["allow_irrevocable_stub_storage"],
+  "build": { "command": "true", "watch_dir": "." },
+  "rules": [
+    { "type": "Text", "globs": ["**/*.txt"], "fallthrough": false }
+  ],
+  "observability": { "enabled": true },
+  "worker_loaders": [
+    { "binding": "LOADER" }
+  ],
+  "vars": {
+    "JSON_CONFIG": { "enabled": true, "name": "compat" }
+  },
+  "kv_namespaces": [
+    { "binding": "TEST_KV", "id": "cloudflare-os-compat-kv", "preview_id": "cloudflare-os-compat-kv" }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "FACET_HOST", "class_name": "FacetHost" }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["FacetHost", "FacetTool", "DirectTool"]
+    }
+  ]
+}

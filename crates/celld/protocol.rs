@@ -72,6 +72,7 @@ pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] = &[
     FEATURE_SQLITE_VEC_V1,
     FEATURE_R2_V1,
     FEATURE_WASM_V1,
+    FEATURE_WORKER_LOADER_V1,
     FEATURE_WORKFLOWS_V1,
 ];
 
@@ -100,6 +101,11 @@ pub const FEATURE_WASM_V1: &str = "wasm-v1";
 /// the reserved workflow cell would load the manifest, build an `env` missing
 /// the binding, and fail only when the application first calls `create()` —
 /// in production, with an error that blames the application.
+/// A deployment with one or more Worker Loader bindings.
+///
+/// Without this gate a node that predates the binding accepts the deployment, omits the binding from `env`,
+/// and fails only when a dynamic worker is first loaded.
+pub const FEATURE_WORKER_LOADER_V1: &str = "worker-loader-v1";
 pub const FEATURE_WORKFLOWS_V1: &str = "workflows-v1";
 
 /// A deployment with `kv_namespaces` bindings. Gated for the same reason

@@ -4083,7 +4083,7 @@ pub struct WorkerConfig {
     /// `fetch` and provide only `queue`.
     declares_queue_consumer: bool,
     workflow_bindings: Vec<WorkflowBinding>,
-    vars: Vec<(String, String)>,
+    vars: Vec<(String, serde_json::Value)>,
     node: String,
     /// The worker's non-main modules, so the main module can import siblings.
     modules: Vec<(String, ModuleSource)>,
@@ -4150,7 +4150,7 @@ pub struct WorkerConfigOptions {
     pub queue_bindings: Vec<QueueBinding>,
     pub queue_consumers: Vec<crate::protocol::QueueConsumerConfig>,
     pub workflow_bindings: Vec<WorkflowBinding>,
-    pub vars: Vec<(String, String)>,
+    pub vars: Vec<(String, serde_json::Value)>,
     pub node: String,
     pub modules: Vec<(String, ModuleSource)>,
     pub compat: Compat,

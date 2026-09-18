@@ -19,7 +19,8 @@ use crate::protocol::{
     ModuleKind, ModuleRef, QueueConsumerAttachment, QueueConsumerConfig, QueueConsumerDeployment,
     Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_CONTAINERS_V1, FEATURE_CRON_V1,
     FEATURE_D1_V1, FEATURE_KV_V1, FEATURE_QUEUES_V1, FEATURE_R2_V1, FEATURE_SQLITE_VEC_V1,
-    FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1, QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
+    FEATURE_WASM_V1, FEATURE_WORKER_LOADER_V1, FEATURE_WORKFLOWS_V1,
+    QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context};
 use flate2::write::GzEncoder;
@@ -56,6 +57,9 @@ const SUPPORTED_KEYS: &[&str] = &[
     "worker_loaders",
     "containers",
     "no_bundle",
+    "build",
+    "rules",
+    "observability",
 ];
 
 /// The Durable Object class every D1 database runs as. It is supplied by the
@@ -294,6 +298,9 @@ struct Project {
     queue_consumers: Vec<QueueConsumerConfig>,
     has_queues: bool,
     has_r2: bool,
+    has_worker_loaders: bool,
+    /// Whether Wrangler Text rules declare `.txt` modules for esbuild to inline.
+    has_text_modules: bool,
     containers: Vec<ContainerDecl>,
 }
 
@@ -550,7 +557,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
                 wasm.sort_by(|a, b| a.0.cmp(&b.0));
                 Ok(BundleOutput { bundle, wasm })
             } else {
-                run_esbuild(&root, entry)
+                run_esbuild(&root, entry, project.has_text_modules)
             }
         })
         .transpose()?;
@@ -634,6 +641,9 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             }
             if project.has_r2 {
                 features.push(FEATURE_R2_V1.to_string());
+            }
+            if project.has_worker_loaders {
+                features.push(FEATURE_WORKER_LOADER_V1.to_string());
             }
             if sqlite_vec {
                 features.push(FEATURE_SQLITE_VEC_V1.to_string());
@@ -1199,6 +1209,10 @@ fn read_project(
         .as_object()
         .ok_or_else(|| anyhow!("{} is not a JSON object", path.display()))?;
 
+    run_build_command(object, root)?;
+    validate_observability(object)?;
+    let has_text_modules = read_text_rules(object)?;
+
     let unsupported = object
         .keys()
         .filter(|key| !SUPPORTED_KEYS.contains(&key.as_str()))
@@ -1752,14 +1766,19 @@ fn read_project(
         }));
     }
     let mut vars = BTreeMap::new();
+    // Wrangler's `vars` may carry a JSON value; the runtime already reads `json` bindings, so a
+    // non-string is declared as one instead of being refused.
+    let mut json_vars: Vec<(&str, &Value)> = Vec::new();
     match object.get("vars") {
         None => {}
         Some(Value::Object(object)) => {
             for (name, value) in object {
-                let value = value
-                    .as_str()
-                    .ok_or_else(|| anyhow!("var binding {name} must be a string"))?;
-                vars.insert(name.as_str(), value);
+                match value {
+                    Value::String(value) => {
+                        vars.insert(name.as_str(), value.as_str());
+                    }
+                    value => json_vars.push((name.as_str(), value)),
+                }
             }
         }
         Some(_) => bail!("config `vars` must be an object"),
@@ -1767,7 +1786,7 @@ fn read_project(
     // An asset-only project has no Worker to hand a variable to, so a
     // `.dev.vars` beside it is residue, not a binding the guard below
     // should refuse in the config's name.
-    let declared_vars = !vars.is_empty();
+    let declared_vars = !vars.is_empty() || !json_vars.is_empty();
     if main.is_some() {
         vars.extend(
             overrides
@@ -1783,6 +1802,16 @@ fn read_project(
             "type": "plain_text",
             "name": name,
             "text": value,
+        }));
+    }
+    for (name, value) in json_vars {
+        if !valid_binding(name) {
+            bail!("invalid var binding name: {name:?}");
+        }
+        bindings.push(json!({
+            "type": "json",
+            "name": name,
+            "json": value,
         }));
     }
     if main.is_none()
@@ -1860,6 +1889,10 @@ fn read_project(
         has_queues: !queue_producers.is_empty() || !queue_consumers.is_empty(),
         queue_consumers,
         has_r2: !r2_buckets.is_empty(),
+        // A malformed list is refused where the binding is built; here the only question is whether the
+        // deployment needs the capability at all.
+        has_worker_loaders: matches!(object.get("worker_loaders"), Some(Value::Array(loaders)) if !loaders.is_empty()),
+        has_text_modules,
         containers,
     })
 }
@@ -1974,6 +2007,123 @@ fn read_containers(
         });
     }
     Ok(declared)
+}
+
+fn run_build_command(object: &Map<String, Value>, root: &Path) -> anyhow::Result<()> {
+    let Some(build) = object.get("build") else {
+        return Ok(());
+    };
+    let build = build
+        .as_object()
+        .ok_or_else(|| anyhow!("config `build` must be an object"))?;
+    let unsupported = build
+        .keys()
+        .filter(|key| !matches!(key.as_str(), "command" | "watch_dir"))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unsupported.is_empty() {
+        bail!(
+            "config `build` does not support these keys: {}",
+            unsupported.join(", ")
+        );
+    }
+    if let Some(watch_dir) = build.get("watch_dir") {
+        let valid = watch_dir.is_string()
+            || watch_dir
+                .as_array()
+                .is_some_and(|values| values.iter().all(Value::is_string));
+        if !valid {
+            bail!("config `build.watch_dir` must be a string or an array of strings");
+        }
+    }
+    let Some(command) = build.get("command") else {
+        return Ok(());
+    };
+    let command = command
+        .as_str()
+        .filter(|command| !command.trim().is_empty())
+        .ok_or_else(|| anyhow!("config `build.command` must be a non-empty string"))?;
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(root)
+        .output()
+        .with_context(|| format!("run Wrangler build command {command:?}"))?;
+    if !output.status.success() {
+        bail!(
+            "Wrangler build command failed ({command:?}):\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn validate_observability(object: &Map<String, Value>) -> anyhow::Result<()> {
+    if let Some(observability) = object.get("observability") {
+        if !observability.is_object() {
+            bail!("config `observability` must be an object");
+        }
+    }
+    Ok(())
+}
+
+fn read_text_rules(object: &Map<String, Value>) -> anyhow::Result<bool> {
+    let Some(rules) = object.get("rules") else {
+        return Ok(false);
+    };
+    let rules = rules
+        .as_array()
+        .ok_or_else(|| anyhow!("config `rules` must be an array"))?;
+    let mut text = false;
+    for (index, rule) in rules.iter().enumerate() {
+        let rule = rule
+            .as_object()
+            .ok_or_else(|| anyhow!("config `rules[{index}]` must be an object"))?;
+        let unsupported = rule
+            .keys()
+            .filter(|key| !matches!(key.as_str(), "type" | "globs" | "fallthrough"))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unsupported.is_empty() {
+            bail!(
+                "config `rules[{index}]` does not support these keys: {}",
+                unsupported.join(", ")
+            );
+        }
+        let kind = rule
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("config `rules[{index}].type` must be a string"))?;
+        if kind != "Text" {
+            bail!("config `rules[{index}]` type {kind:?} is not supported; celld currently supports only Wrangler Text rules");
+        }
+        if rule
+            .get("fallthrough")
+            .is_some_and(|value| value.as_bool() != Some(false))
+        {
+            bail!("config `rules[{index}].fallthrough` must be false when present");
+        }
+        let globs = rule
+            .get("globs")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("config `rules[{index}].globs` must be an array"))?;
+        if globs.is_empty() {
+            bail!("config `rules[{index}].globs` must not be empty");
+        }
+        for (glob_index, glob) in globs.iter().enumerate() {
+            let glob = glob.as_str().ok_or_else(|| {
+                anyhow!("config `rules[{index}].globs[{glob_index}]` must be a string")
+            })?;
+            if !matches!(glob, "**/*.txt" | "*.txt") {
+                bail!(
+                    "config `rules[{index}].globs[{glob_index}]` is {glob:?}; celld Text rules currently support only extension-wide *.txt globs"
+                );
+            }
+        }
+        text = true;
+    }
+    Ok(text)
 }
 
 fn reject_queue_keys(value: &Value, accepted: &[&str], kind: &str) -> anyhow::Result<()> {
@@ -2611,7 +2761,7 @@ fn collect_unbundled_wasm(
     Ok(())
 }
 
-fn run_esbuild(root: &Path, entry: &str) -> anyhow::Result<BundleOutput> {
+fn run_esbuild(root: &Path, entry: &str, has_text_modules: bool) -> anyhow::Result<BundleOutput> {
     // node: builtins stay external. Wrangler polyfills them with unenv; celld
     // implements the workerd `nodejs_compat` subset itself, so the runtime
     // provides them.
@@ -2656,6 +2806,7 @@ fn run_esbuild(root: &Path, entry: &str) -> anyhow::Result<BundleOutput> {
         // files agree on names; the runtime serves each file as a compiled
         // WebAssembly.Module default export.
         .arg("--loader:.wasm=copy")
+        .args(if has_text_modules { vec!["--loader:.txt=text"] } else { Vec::new() })
         .arg(format!("--outdir={}", outdir.path().display()))
         .arg("--entry-names=index")
         .output()

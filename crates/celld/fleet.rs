@@ -1011,13 +1011,22 @@ fn service_bindings(manifest: &Manifest) -> Vec<(String, String, Option<String>)
         .collect()
 }
 
-fn worker_vars(manifest: &Manifest) -> Vec<(String, String)> {
-    bindings(manifest, "plain_text")
-        .filter_map(|binding| {
-            Some((
-                binding.get("name")?.as_str()?.to_string(),
-                binding.get("text")?.as_str()?.to_string(),
-            ))
-        })
-        .collect()
+/// The Worker variables of a manifest. A `plain_text` binding carries a
+/// string; a `json` binding carries the JSON value that Wrangler's `vars` held
+/// for it, and the runtime installs it as an object so `env.NAME` reads what
+/// the config declared instead of its source text.
+fn worker_vars(manifest: &Manifest) -> Vec<(String, serde_json::Value)> {
+    let plain = bindings(manifest, "plain_text").filter_map(|binding| {
+        Some((
+            binding.get("name")?.as_str()?.to_string(),
+            serde_json::Value::String(binding.get("text")?.as_str()?.to_string()),
+        ))
+    });
+    let json = bindings(manifest, "json").filter_map(|binding| {
+        Some((
+            binding.get("name")?.as_str()?.to_string(),
+            binding.get("json")?.clone(),
+        ))
+    });
+    plain.chain(json).collect()
 }

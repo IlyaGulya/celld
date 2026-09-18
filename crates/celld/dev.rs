@@ -36,6 +36,7 @@ pub fn open_local_bucket(database: &Path) -> anyhow::Result<Bucket> {
 #[derive(Debug)]
 struct Options {
     project: Option<PathBuf>,
+    services: Vec<PathBuf>,
     clean: bool,
     stack: StackOptions,
 }
@@ -166,24 +167,26 @@ impl Console {
 }
 
 struct ProjectWatcher {
-    project: PathBuf,
+    projects: Vec<PathBuf>,
     ignored: Vec<Pattern>,
     _watcher: notify::RecommendedWatcher,
     changes: mpsc::UnboundedReceiver<notify::Result<notify::Event>>,
 }
 
 impl ProjectWatcher {
-    fn new(project: &Path, ignored: Vec<Pattern>) -> anyhow::Result<Self> {
+    fn new(projects: &[PathBuf], ignored: Vec<Pattern>) -> anyhow::Result<Self> {
         let (sender, changes) = mpsc::unbounded_channel();
         let mut watcher = notify::recommended_watcher(move |event| {
             let _ = sender.send(event);
         })
         .context("create the project watcher")?;
-        watcher
-            .watch(project, RecursiveMode::Recursive)
-            .with_context(|| format!("watch the project directory {}", project.display()))?;
+        for project in projects {
+            watcher
+                .watch(project, RecursiveMode::Recursive)
+                .with_context(|| format!("watch the project directory {}", project.display()))?;
+        }
         Ok(Self {
-            project: project.to_path_buf(),
+            projects: projects.to_vec(),
             ignored,
             _watcher: watcher,
             changes,
@@ -214,7 +217,7 @@ impl ProjectWatcher {
                 .await
                 .context("the project watcher stopped")?
             {
-                Ok(event) if relevant_project_event(&self.project, &event, &self.ignored) => {
+                Ok(event) if relevant_project_event(&self.projects, &event, &self.ignored) => {
                     return Ok(())
                 }
                 Ok(_) => {}
@@ -224,7 +227,11 @@ impl ProjectWatcher {
     }
 }
 
-fn relevant_project_event(project: &Path, event: &notify::Event, ignored: &[Pattern]) -> bool {
+fn relevant_project_event(
+    projects: &[PathBuf],
+    event: &notify::Event,
+    ignored: &[Pattern],
+) -> bool {
     // A read is not a change. The inotify backend reports `Access(Open(Any))`
     // for every file that the bundler and the deploy step read, so a rebuild
     // produces the events that request the next rebuild and the supervisor
@@ -235,10 +242,11 @@ fn relevant_project_event(project: &Path, event: &notify::Event, ignored: &[Patt
     if matches!(event.kind, notify::EventKind::Access(_)) {
         return false;
     }
-    event
-        .paths
-        .iter()
-        .any(|path| !ignored_project_path(project, path, ignored))
+    event.paths.iter().any(|path| {
+        projects.iter().any(|project| {
+            path.starts_with(project) && !ignored_project_path(project, path, ignored)
+        })
+    })
 }
 
 fn ignored_project_path(project: &Path, path: &Path, ignored: &[Pattern]) -> bool {
@@ -333,7 +341,7 @@ impl ShutdownSignals {
 pub fn print_help() -> anyhow::Result<()> {
     crate::cli_output::Output::new(crate::cli_output::Format::Text).help(
         &format!("celld dev — run an application with persistent local storage\n\n\
-USAGE:\n  celld dev [PROJECT] [--host IP] [--port PORT] [--logs] [--no-watch] [--clean]\n\n\
+USAGE:\n  celld dev [PROJECT] [--service PROJECT]... [--host IP] [--port PORT] [--logs] [--no-watch] [--clean]\n\n\
 PROJECT is a directory or a Wrangler config. It defaults to the current\n\
 directory. celld stores all local state in PROJECT/.celld/dev, and it keeps\n\
 that state across a restart. A configuration change does not migrate the\n\
@@ -341,13 +349,14 @@ state, so a cell can keep a value that the new configuration rejects. Use\n\
 --clean to start from an empty local state.\n\n\
 A .dev.vars file beside the config supplies Worker variables in dotenv form,\n\
 as for wrangler dev. Its entries override the vars of the config.\n\n\
-OPTIONS:\n  --host IP              Worker listener host (default: 127.0.0.1)\n  --port PORT            Worker listener port (default: {DEFAULT_PORT})\n  --clean                Delete PROJECT/.celld/dev before the server starts\n  --logs                 Show the node warning and information logs\n  --no-watch             Do not rebuild when a project file changes\n  --watch-ignore PATTERN Ignore a project-relative glob; repeat as needed\n  -h, --help             Show this help"
+OPTIONS:\n  --service PROJECT       Predeploy a named service Worker before PROJECT; repeatable\n  --host IP              Worker listener host (default: 127.0.0.1)\n  --port PORT            Worker listener port (default: {DEFAULT_PORT})\n  --clean                Delete PROJECT/.celld/dev before the server starts\n  --logs                 Show the node warning and information logs\n  --no-watch             Do not rebuild when a project file changes\n  --watch-ignore PATTERN Ignore a project-relative glob; repeat as needed\n  -h, --help             Show this help"
         ),
     )
 }
 
 fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Options>> {
     let mut project = None;
+    let mut services = Vec::new();
     let mut host = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let mut port = DEFAULT_PORT;
     let mut clean = false;
@@ -361,6 +370,12 @@ fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Optio
             "--clean" => clean = true,
             "--logs" => logs = true,
             "--no-watch" => watch = false,
+            "--service" => {
+                let value = arguments
+                    .next()
+                    .context("--service requires a project path")?;
+                services.push(PathBuf::from(value));
+            }
             "--watch-ignore" => {
                 let value = arguments
                     .next()
@@ -395,6 +410,7 @@ fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Optio
     }
     Ok(Some(Options {
         project,
+        services,
         clean,
         stack: StackOptions {
             listener: SocketAddr::new(host, port),
@@ -411,9 +427,31 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         print_help()?;
         return Ok(());
     };
-    let config = deploy::resolve_config(options.project)?;
+    let Options {
+        project: project_arg,
+        services: service_args,
+        clean,
+        stack,
+    } = options;
+    let config = deploy::resolve_config(project_arg)?;
     let config = std::fs::canonicalize(&config)
         .with_context(|| format!("resolve Wrangler config {}", config.display()))?;
+    let mut services = Vec::with_capacity(service_args.len());
+    for service in service_args {
+        let service = deploy::resolve_config(Some(service))?;
+        let service = std::fs::canonicalize(&service)
+            .with_context(|| format!("resolve service Wrangler config {}", service.display()))?;
+        if service == config {
+            bail!("a --service project cannot be the root PROJECT itself");
+        }
+        if services.contains(&service) {
+            bail!(
+                "the same --service project was specified more than once: {}",
+                service.display()
+            );
+        }
+        services.push(service);
+    }
     let project = config
         .parent()
         .context("the Wrangler config has no project directory")?;
@@ -421,11 +459,14 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
     let console = Console::new();
     console.header();
     console.detail("Project", &config.display().to_string());
+    if !services.is_empty() {
+        console.detail("Services", &services.len().to_string());
+    }
     console.detail("State", &state.path().display().to_string());
     // The delete runs before the directory is recreated, and the console names
     // the outcome. A developer who reaches for this flag is already unsure
     // which state the run uses, so a silent delete would answer nothing.
-    if options.clean {
+    if clean {
         let discarded = state.discard()?;
         console.detail(
             "Clean",
@@ -437,10 +478,10 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         );
     }
     prepare_state(state.path())?;
-    if !options.stack.logs {
+    if !stack.logs {
         console.detail("Logs", "hidden (use --logs)");
     }
-    if !options.stack.watch {
+    if !stack.watch {
         console.detail("Watch", "disabled");
     }
 
@@ -451,8 +492,9 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
     let store = open_store(state.path(), &console).await?;
     run_stack(
         &config,
+        &services,
         state.path(),
-        options.stack,
+        stack,
         &project_hash,
         &store,
         &console,
@@ -530,8 +572,23 @@ async fn deploy_project(config: &Path, store: &Store, logs: bool) -> anyhow::Res
     deploy::write(&bucket, &built).await
 }
 
+async fn deploy_stack(
+    config: &Path,
+    services: &[PathBuf],
+    store: &Store,
+    logs: bool,
+) -> anyhow::Result<()> {
+    for service in services {
+        deploy_project(service, store, logs).await?;
+    }
+    // The root project moves the fleet-wide current pointer last. Named service
+    // pointers written above remain available to DeploymentGraph service loading.
+    deploy_project(config, store, logs).await
+}
+
 async fn run_stack(
     config: &Path,
+    services: &[PathBuf],
     state: &Path,
     options: StackOptions,
     project_hash: &str,
@@ -543,16 +600,30 @@ async fn run_stack(
     // handler afterwards leaves the new node orphaned under the default Unix
     // signal action.
     let mut signals = ShutdownSignals::install()?;
-    let project = config
-        .parent()
-        .context("the Wrangler config has no project directory")?;
+    let mut projects = Vec::with_capacity(services.len() + 1);
+    projects.push(
+        config
+            .parent()
+            .context("the Wrangler config has no project directory")?
+            .to_path_buf(),
+    );
+    for service in services {
+        projects.push(
+            service
+                .parent()
+                .context("a service Wrangler config has no project directory")?
+                .to_path_buf(),
+        );
+    }
+    projects.sort();
+    projects.dedup();
     let mut watcher = options
         .watch
-        .then(|| ProjectWatcher::new(project, options.watch_ignores))
+        .then(|| ProjectWatcher::new(&projects, options.watch_ignores))
         .transpose()?;
 
     console.progress("building the application");
-    deploy_project(config, store, options.logs).await?;
+    deploy_stack(config, services, store, options.logs).await?;
     let mut running = start_node(
         state,
         options.listener,
@@ -578,7 +649,7 @@ async fn run_stack(
             }
             NodeEvent::Reload => {
                 console.progress("change detected; rebuilding the application");
-                if let Err(error) = deploy_project(config, store, options.logs).await {
+                if let Err(error) = deploy_stack(config, services, store, options.logs).await {
                     console.failure(&format!("reload failed: {error:#}"));
                     continue;
                 }

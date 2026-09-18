@@ -1,0 +1,9 @@
+{
+  "name": "cfos-same-class-router",
+  "main": "same-class-router.js",
+  "compatibility_date": "2026-09-11",
+  "services": [
+    { "binding": "A", "service": "cfos-same-class-a" },
+    { "binding": "B", "service": "cfos-same-class-b" }
+  ]
+}
