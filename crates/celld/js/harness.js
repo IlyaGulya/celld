@@ -3970,10 +3970,15 @@ const __rpcNoSuchMethod = (prop) => new TypeError(
 const __rpcBindMethod = (value, receiver) =>
   Reflect.apply(Function.prototype.bind, value, [receiver]);
 const __stubResolve = (target, prop) => {
+  // A Proxy that reports RpcTarget or a plain object synthesizes its methods
+  // in its own get trap, so the receiver cannot test for them: Workerd admits
+  // any name the proxy's prototype chain claims.
+  const proxyTarget = __util_proxy_details(target) !== undefined;
   if (target instanceof __cf.RpcTarget) {
-    if (Object.hasOwn(target, prop) || !(prop in target) ||
-        prop in Object.prototype) throw __rpcNoSuchMethod(prop);
-  } else if (!Object.hasOwn(target, prop)) {
+    if (Object.hasOwn(target, prop) ||
+        (!proxyTarget && !(prop in target)) || prop in Object.prototype)
+      throw __rpcNoSuchMethod(prop);
+  } else if (!Object.hasOwn(target, prop) && !proxyTarget) {
     throw __rpcNoSuchMethod(prop);
   }
   const value = target[prop];
@@ -4218,9 +4223,28 @@ const __stubLift = (value, transport = true, originals) => {
       // nested channel tokens).
       lifted = true;
       caps = true;
-      const marker = { "__celld$svc": svc.name, t: __stubIsolate };
+      // A loopback stub is identified by its script, entrypoint, and props:
+      // the receiver re-mints it as an ordinary service binding, so props
+      // keep crossing the way the binding's own calls do.
+      const route = __outboundMeta.get(v);
+      const marker = { "__celld$svc": svc.name,
+                       s: route?.script ?? __cell.script };
       seen.set(v, marker);
-      if (svc.props !== undefined) marker.p = lift(svc.props);
+      if (svc.props !== undefined) marker.p = __rpcOut(svc.props, "bridge");
+      return marker;
+    }
+    const route = __outboundMeta.get(v);
+    if (route !== undefined) {
+      if (!allowCapabilities) return v;
+      // A service binding is a durable capability: it re-mints from its
+      // script, entrypoint, and props in any isolate, so it crosses as data
+      // rather than as a handle to this isolate.
+      lifted = true;
+      caps = true;
+      const marker = { "__celld$svc": route.entrypoint ?? "default",
+                       s: route.script };
+      seen.set(v, marker);
+      if (route.propsSc !== undefined) marker.p = route.propsSc;
       return marker;
     }
     // A DurableObjectClass is capability-like metadata: a class of this
@@ -4488,9 +4512,9 @@ const __stubRevive = (value) => {
     }
     const svcName = v["__celld$svc"];
     if (svcName !== undefined)
-      return v.t === __stubIsolate
-        ? __entrypointStub(svcName, revive(v.p))
-        : __foreignStub();
+      return typeof v.s === "string"
+        ? __makeServiceBinding(v.s, svcName, revive(v.p))
+        : __entrypointStub(svcName, revive(v.p));
     // A DurableObjectClass: a class of this script revives against the self
     // loader, one of a co-hosted script against that script's loader minted
     // here, and an anonymous Worker Loader class against the sender's local
@@ -4576,7 +4600,8 @@ const __entrypointResolve = (inst, prop) => {
   if (__entrypointReserved.has(prop))
     throw new TypeError("'" + prop +
       "' is a reserved method and cannot be called over RPC.");
-  if (Object.hasOwn(inst, prop) || !(prop in inst) ||
+  const proxyTarget = __util_proxy_details(inst) !== undefined;
+  if (Object.hasOwn(inst, prop) || (!proxyTarget && !(prop in inst)) ||
       prop in Object.prototype)
     throw __rpcNoSuchMethod(prop);
   const value = inst[prop];
@@ -4806,23 +4831,29 @@ const __stubSession = (meta) => ({
   get: (path) => __stubOp(meta, path, null),
   call: (path, args) => __stubOp(meta, path, args),
 });
-const __entrypointSession = (name, local, script, makeInst, propsSc) => ({
-  get: (path) => local
-    ? (async () => __rpcDes(
-        await __entrypointOp(name, path, null, true, makeInst)))()
-    : (async () => __rpcDes(
+const __entrypointSession = (name, local, script, makeInst, propsSc) => {
+  // `props` are the binding's own, and a local binding decodes them here the
+  // way the host decodes them for a cross-script one.
+  const props = propsSc === undefined || propsSc === null ||
+      propsSc.length === 0 ? undefined : __sc_decode(propsSc);
+  return {
+    get: (path) => local
+      ? (async () => __rpcDes(
+          await __entrypointOp(name, path, null, true, makeInst, props)))()
+      : (async () => __rpcDes(
+          await __svc_rpc(
+            script, name, JSON.stringify(path), null, propsSc)))(),
+    call: (path, args) => (async () => {
+      const argsSc = __rpcOut(args, local ? true : "bridge");
+      if (local)
+        return __rpcDes(await __entrypointOp(
+          name, path, argsSc, true, makeInst, props));
+      return __rpcDes(
         await __svc_rpc(
-          script, name, JSON.stringify(path), null, propsSc)))(),
-  call: (path, args) => (async () => {
-    const argsSc = __rpcOut(args, local ? true : "bridge");
-    if (local)
-      return __rpcDes(await __entrypointOp(
-        name, path, argsSc, true, makeInst));
-    return __rpcDes(
-      await __svc_rpc(
-        script, name, JSON.stringify(path), argsSc, propsSc));
-  })(),
-});
+          script, name, JSON.stringify(path), argsSc, propsSc));
+    })(),
+  };
+};
 // Workerd's JsRpcPromise/JsRpcProperty: awaitable, callable, and
 // property access extends a path resolved at the far end, so
 // intermediates obey Workerd's receiver rules. `ctx` is the node's
@@ -5141,9 +5172,20 @@ const __storedLift = (value) => {
     const svc = __svcMeta.get(v);
     if (svc !== undefined) {
       lifted = true;
-      const marker = { "__celld$svc": svc.name };
+      const route = __outboundMeta.get(v);
+      const marker = { "__celld$svc": svc.name,
+                       s: route?.script ?? __cell.script };
       seen.set(v, marker);
-      if (svc.props !== undefined) marker.p = lift(svc.props);
+      if (svc.props !== undefined) marker.p = __rpcOut(svc.props, false);
+      return marker;
+    }
+    const outbound = __outboundMeta.get(v);
+    if (outbound !== undefined) {
+      lifted = true;
+      const marker = { "__celld$svc": outbound.entrypoint ?? "default",
+                       s: outbound.script };
+      seen.set(v, marker);
+      if (outbound.propsSc !== undefined) marker.p = outbound.propsSc;
       return marker;
     }
     if (v instanceof __cf.RpcPromise ||
@@ -5199,7 +5241,9 @@ const __storedRevive = (value) => {
       return __makeLazyPersistentRestoreStub(restoreScope, revive(v.p));
     const svcName = v["__celld$svc"];
     if (svcName !== undefined)
-      return __entrypointStub(svcName, revive(v.p));
+      return typeof v.s === "string"
+        ? __makeServiceBinding(v.s, svcName, revive(v.p))
+        : __entrypointStub(svcName, revive(v.p));
     const classScript = v["__celld$doClassSvc"];
     if (classScript !== undefined) {
       const name = v.n === undefined ? "default" : String(v.n);
@@ -5577,12 +5621,25 @@ class DurableObjectNamespace {
       // Every cell RPC goes out through the host, whichever node owns the
       // target. Same-process dispatch re-enters this isolate, where the
       // abort and exit markers revive; bytes that land elsewhere revive as
-      // loud foreign stubs.
-      return async (...args) => invoke(
-        async () => __rpcDes(await __rpc_call(
-          scope, dispatchName ?? null, prop, __rpcOut(args, "bridge"),
-        )),
-      );
+      // bridge handles. The call is Workerd's JsRpcPromise, so a property
+      // path continues on the result before it settles
+      // (`host.open().method()`).
+      const methodSession = {
+        root: () => Promise.reject(new TypeError(
+          '"' + prop + '" is not a function.')),
+        get: (path) => Promise.reject(new TypeError(
+          '"' + prop + "." + path.join(".") + '" is not a function.')),
+        call: (path, args) => {
+          if (path.length !== 0)
+            throw new Error(
+              "Pipelined property paths on Durable Object RPC are not " +
+              "supported yet.");
+          return invoke(async () => __rpcDes(await __rpc_call(
+            scope, dispatchName ?? null, prop, __rpcOut(args, "bridge"),
+          )));
+        },
+      };
+      return __makeNode(methodSession, [], __ctxNow());
     }});
     __doStubMeta.set(stub, id);
     return stub;
