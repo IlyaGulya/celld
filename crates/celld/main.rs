@@ -433,13 +433,12 @@ enum RemoteRetryOutcome {
     Cancelled,
 }
 
-/// Keep the one-retry transport policy, but do not spend that retry on an
-/// ownership generation which a reachable peer already rejected.
-///
-/// A replacement can bind the prior address while the prior session's lease
-/// is still live. The new process then gives a definitive `NotOwner` answer
-/// for the old `(node, epoch)`. An immediate redispatch resolves that same
-/// generation and fails a safe application retry before ownership can move.
+/// Keep the one immediate transport retry, then wait out a route generation
+/// which is known unusable. A definitive `NotOwner` blocks immediately; a
+/// `NeverConnected` attempt is safe to retry because the request provably did
+/// not execute, but if the immediate redispatch resolves the same live lease
+/// we must wait for ownership to change instead of returning an avoidable
+/// outage.
 struct RemoteRouteRetry {
     dispatcher: celld_logic::routing::Dispatcher,
     generation: Option<(String, u64)>,
@@ -492,6 +491,7 @@ impl RemoteRouteRetry {
             celld_logic::routing::Attempt::NeverConnected
                 if self.dispatcher.redispatch(attempt) =>
             {
+                self.blocked = true;
                 RemoteRetryAction::Redispatch
             }
             celld_logic::routing::Attempt::NeverConnected => RemoteRetryAction::Stop,
