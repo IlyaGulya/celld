@@ -16,9 +16,16 @@ concurrency:
 
 env:
   RUST_VERSION: 1.97.1
+  # One credential pair for every gate. moto does not verify the signature, but
+  # celld signs anyway, so the value only has to be well formed.
+  AWS_ACCESS_KEY_ID: agentos
+  AWS_SECRET_ACCESS_KEY: agentos-test-secret
+  AWS_REGION: us-east-1
+  S3_ENDPOINT: http://127.0.0.1:19100
 
 jobs:
   compat:
+    name: single node
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     steps:
@@ -33,7 +40,6 @@ jobs:
       - name: Verify formatting
         run: cargo fmt --all -- --check
 
-
       - name: Build celld
         run: cargo build --locked
 
@@ -42,3 +48,85 @@ jobs:
 
       - name: Run Cloudflare OS compatibility sentinel
         run: bash examples/cloudflare-os-compat/test.sh "$PWD/target/debug/celld"
+
+  fleet:
+    name: fleet
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      # The replacement drills start a runtime built from an older ref, so the
+      # job needs those refs rather than only the pushed commit.
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+
+      - name: Install esbuild
+        run: npm install --global esbuild
+
+      - name: Build this runtime
+        run: cargo build --locked
+
+      - name: Build the replaced runtimes
+        run: |
+          set -euo pipefail
+          for ref in agentos-pre-v050-runtime v0.5.0; do
+            worktree="/tmp/celld-$(echo "$ref" | tr '/.' '--')"
+            git worktree add "$worktree" "$ref"
+            (cd "$worktree" && cargo build --locked)
+          done
+
+      - name: Start the S3 stand
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet "moto[server]"
+          nohup python3 -m moto.server -p 19100 -H 127.0.0.1 >/tmp/moto.log 2>&1 &
+          shim=examples/cloudflare-os-compat/mc-shim.py
+          for attempt in $(seq 1 60); do
+            if python3 "$shim" alias set s3 "$S3_ENDPOINT" \
+                 "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" >/dev/null 2>&1 &&
+               python3 "$shim" mb s3/agentos-phase0 >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "the S3 stand never became usable" >&2
+          cat /tmp/moto.log >&2
+          exit 1
+
+      - name: Two-node capability and SIGKILL failover
+        run: |
+          set -euo pipefail
+          CELLD_HA_BUCKET="s3://agentos-phase0/${{ github.run_id }}/ha" \
+          CELLD_HA_ENDPOINT="$S3_ENDPOINT" \
+            bash examples/cloudflare-os-compat/ha-test.sh "$PWD/target/debug/celld"
+
+      - name: Object-store-only disaster restore
+        run: |
+          set -euo pipefail
+          CELLD_BACKUP_SOURCE="s3://agentos-phase0/${{ github.run_id }}/backup-source" \
+          CELLD_BACKUP_RESTORE="s3://agentos-phase0/${{ github.run_id }}/backup-restore" \
+          CELLD_BACKUP_ENDPOINT="$S3_ENDPOINT" \
+          CELLD_MC="python3 $PWD/examples/cloudflare-os-compat/mc-shim.py" \
+            bash examples/cloudflare-os-compat/restore-test.sh "$PWD/target/debug/celld"
+
+      # Both shapes of the stop-the-fleet contract: the pre-v0.5.0 runtime
+      # leaves a bucket whose format needs migrating (boot refusal), while a
+      # stock v0.5.0 node leaves the current format (peer refusal).
+      - name: Mixed-version replacement
+        run: |
+          set -euo pipefail
+          run=0
+          for ref in agentos-pre-v050-runtime v0.5.0; do
+            run=$((run + 1))
+            worktree="/tmp/celld-$(echo "$ref" | tr '/.' '--')"
+            CELLD_UPGRADE_BUCKET="s3://agentos-phase0/${{ github.run_id }}/upgrade-$run" \
+            CELLD_UPGRADE_ENDPOINT="$S3_ENDPOINT" \
+              bash examples/cloudflare-os-compat/upgrade-test.sh \
+                "$worktree/target/debug/celld" "$PWD/target/debug/celld"
+          done
