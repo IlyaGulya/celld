@@ -1240,15 +1240,20 @@ impl Generation {
                 // script-scoped routing class: two scripts exporting the same
                 // public name keep distinct cells instead of colliding here.
                 let routing_class = js::routing_class(&script, &class, !is_primary);
-                register_cell_class(&mut cell_configs, routing_class, config.clone(), &|routing| {
-                    if is_primary {
-                        anyhow!("duplicate Durable Object class {routing}")
-                    } else {
-                        anyhow!(
+                register_cell_class(
+                    &mut cell_configs,
+                    routing_class,
+                    config.clone(),
+                    &|routing| {
+                        if is_primary {
+                            anyhow!("duplicate Durable Object class {routing}")
+                        } else {
+                            anyhow!(
                             "Durable Object routing class {routing} is exported by more than one co-hosted script"
                         )
-                    }
-                })?;
+                        }
+                    },
+                )?;
             }
             // Cron is runtime-supplied, not a manifest class. Its alarm calls
             // the primary script's scheduled handler with that script's bindings.

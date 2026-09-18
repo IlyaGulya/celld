@@ -9777,14 +9777,15 @@ fn op_loader_load(
             else {
                 return loader_throw(scope, "worker loader: malformed tail route");
             };
-            let Some(script) = entry.get_index(scope, 0).filter(|value| value.is_string())
-            else {
+            let Some(script) = entry.get_index(scope, 0).filter(|value| value.is_string()) else {
                 return loader_throw(scope, "worker loader: malformed tail script");
             };
-            let entrypoint = entry.get_index(scope, 1).and_then(|value| {
-                (value.is_string()).then(|| value.to_rust_string_lossy(scope))
-            });
-            let Some(props) = entry.get_index(scope, 2).and_then(|value| view_bytes(value))
+            let entrypoint = entry
+                .get_index(scope, 1)
+                .and_then(|value| (value.is_string()).then(|| value.to_rust_string_lossy(scope)));
+            let Some(props) = entry
+                .get_index(scope, 2)
+                .and_then(|value| view_bytes(value))
             else {
                 return loader_throw(scope, "worker loader: tail props are not bytes");
             };

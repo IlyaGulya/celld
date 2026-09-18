@@ -363,7 +363,10 @@ pub(super) fn transfer_worker_websocket_handoff(id: u64) -> Option<WorkerWebSock
         .lock()
         .unwrap()
         .retain(|opened| *opened != id);
-    Some(WorkerWebSocket { id, inbound: Some(inbound) })
+    Some(WorkerWebSocket {
+        id,
+        inbound: Some(inbound),
+    })
 }
 
 /// Close every isolate-polled socket a finished request opened.

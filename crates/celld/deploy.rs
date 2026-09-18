@@ -2817,7 +2817,11 @@ fn run_esbuild(root: &Path, entry: &str, has_text_modules: bool) -> anyhow::Resu
         // files agree on names; the runtime serves each file as a compiled
         // WebAssembly.Module default export.
         .arg("--loader:.wasm=copy")
-        .args(if has_text_modules { vec!["--loader:.txt=text"] } else { Vec::new() })
+        .args(if has_text_modules {
+            vec!["--loader:.txt=text"]
+        } else {
+            Vec::new()
+        })
         .arg(format!("--outdir={}", outdir.path().display()))
         .arg("--entry-names=index")
         .output()

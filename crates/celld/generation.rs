@@ -358,10 +358,13 @@ impl Generation {
     /// it is present in the map.
     #[doc(hidden)]
     pub fn service_class_config(&self, script: &str, class: &str) -> Option<Arc<WorkerConfig>> {
-        [crate::js::routing_class(script, class, true), class.to_string()]
-            .into_iter()
-            .find_map(|key| self.cell_configs.get(&key).cloned())
-            .filter(|config| config.script_name == script)
+        [
+            crate::js::routing_class(script, class, true),
+            class.to_string(),
+        ]
+        .into_iter()
+        .find_map(|key| self.cell_configs.get(&key).cloned())
+        .filter(|config| config.script_name == script)
     }
 
     /// The engine's reserved Durable Object classes this generation

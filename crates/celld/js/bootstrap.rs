@@ -790,7 +790,10 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
                 // leaves unescaped. Those are escaped here so a config cannot
                 // terminate the snippet it is embedded in.
                 value => {
-                    let literal = value.to_string().replace('\u{2028}', "\\u2028").replace('\u{2029}', "\\u2029");
+                    let literal = value
+                        .to_string()
+                        .replace('\u{2028}', "\\u2028")
+                        .replace('\u{2029}', "\\u2029");
                     lines.push_str(&format!("e[{:?}] = {literal};\n", name));
                 }
             }
