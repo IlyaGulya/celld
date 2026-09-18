@@ -123,12 +123,20 @@ jobs:
       - name: Mixed-version replacement
         run: |
           set -euo pipefail
-          run=0
+          # Each variant gets its own ports and prefix: the first run's nodes are
+          # signalled at exit, and their listeners are not guaranteed to be gone
+          # by the time the second run binds the same numbers.
+          offset=0
           for ref in agentos-pre-v050-runtime v0.5.0; do
-            run=$((run + 1))
-            worktree="/tmp/celld-$(echo "$ref" | tr '/.' '--')"
-            CELLD_UPGRADE_BUCKET="s3://agentos-phase0/${{ github.run_id }}/upgrade-$run" \
+            slug="$(echo "$ref" | tr '/.' '--')"
+            worktree="/tmp/celld-$slug"
+            CELLD_UPGRADE_BUCKET="s3://agentos-phase0/${{ github.run_id }}/upgrade-$slug" \
             CELLD_UPGRADE_ENDPOINT="$S3_ENDPOINT" \
+            CELLD_UPGRADE_PORT_OLD=$((19971 + offset)) \
+            CELLD_UPGRADE_PORT_NEW=$((19972 + offset)) \
+            CELLD_UPGRADE_PEER_OLD=$((19981 + offset)) \
+            CELLD_UPGRADE_PEER_NEW=$((19982 + offset)) \
               bash examples/cloudflare-os-compat/upgrade-test.sh \
                 "$worktree/target/debug/celld" "$PWD/target/debug/celld"
+            offset=$((offset + 10))
           done
