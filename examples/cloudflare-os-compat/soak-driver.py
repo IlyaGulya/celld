@@ -145,28 +145,31 @@ def reader(base, timeout, window, metrics, stop, pace, origin):
             time.sleep(pace)
 
 
-def sample(url, stop, samples, interval):
+def sample(urls, stop, samples, interval):
+    """Sample every node, because a capability's origin can be any of them."""
     while not stop.is_set():
-        try:
-            with urllib.request.urlopen(url, timeout=10) as response:
-                state = json.loads(response.read())
-            samples.append(
-                {
-                    "at": round(time.monotonic(), 3),
-                    "handles": state.get("rpc_bridge_handles"),
-                    "cells": state.get("cells") or state.get("live_cells"),
-                }
-            )
-        except Exception:  # noqa: BLE001 - a node being killed is expected
-            samples.append({"at": round(time.monotonic(), 3), "handles": None})
+        total = 0
+        seen = 0
+        for url in urls:
+            try:
+                with urllib.request.urlopen(url, timeout=10) as response:
+                    state = json.loads(response.read())
+                handles = state.get("rpc_bridge_handles")
+                if isinstance(handles, int):
+                    total += handles
+                    seen += 1
+            except Exception:  # noqa: BLE001 - a node being killed is expected
+                continue
+        samples.append(
+            {"at": round(time.monotonic(), 3), "handles": total if seen else None}
+        )
         stop.wait(interval)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--base-a", required=True)
-    parser.add_argument("--base-b", required=True)
-    parser.add_argument("--state-url", required=True)
+    parser.add_argument("--base", action="append", required=True, dest="bases")
+    parser.add_argument("--state-url", action="append", required=True, dest="state_urls")
     parser.add_argument("--duration", type=float, required=True)
     parser.add_argument("--writers", type=int, default=2)
     parser.add_argument("--readers", type=int, default=4)
@@ -178,10 +181,10 @@ def main():
     parser.add_argument("--output", required=True)
     arguments = parser.parse_args()
 
-    # The fleet becomes usable asynchronously after both nodes report health, so
+    # The fleet becomes usable asynchronously after the nodes report health, so
     # wait for a first successful call on each node before counting: the bars
     # describe steady state, not fleet startup.
-    for name, base in (("a", arguments.base_a), ("b", arguments.base_b)):
+    for name, base in enumerate(arguments.bases):
         deadline = time.monotonic() + 120
         while time.monotonic() < deadline:
             try:
@@ -225,7 +228,7 @@ def main():
         threading.Thread(
             target=writer,
             args=(
-                arguments.base_a if index % 2 else arguments.base_b,
+                arguments.bases[index % len(arguments.bases)],
                 "/bump",
                 arguments.timeout,
                 window,
@@ -241,7 +244,7 @@ def main():
         threading.Thread(
             target=reader,
             args=(
-                arguments.base_a if index % 2 else arguments.base_b,
+                arguments.bases[index % len(arguments.bases)],
                 arguments.timeout,
                 window,
                 metrics,
@@ -255,7 +258,7 @@ def main():
     ] + [
         threading.Thread(
             target=sample,
-            args=(arguments.state_url, stop, samples, arguments.sample_ms / 1000),
+            args=(arguments.state_urls, stop, samples, arguments.sample_ms / 1000),
             daemon=True,
         ),
         threading.Thread(target=watch_signal, daemon=True),
@@ -269,16 +272,25 @@ def main():
     # Quiesce: with no load in flight, request-end retirement has to drain the
     # origin node's bridge handles.
     handles_after_load = None
+    handles_after_load_by_node = {}
     deadline = time.monotonic() + arguments.quiesce_s
     while time.monotonic() < deadline:
-        try:
-            with urllib.request.urlopen(arguments.state_url, timeout=10) as response:
-                state = json.loads(response.read())
-            handles_after_load = state.get("rpc_bridge_handles")
-            if handles_after_load == 0:
-                break
-        except Exception:  # noqa: BLE001 - the owner may be mid-restart
-            pass
+        per_node = {}
+        for url in arguments.state_urls:
+            try:
+                with urllib.request.urlopen(url, timeout=10) as response:
+                    state = json.loads(response.read())
+                per_node[url] = state.get("rpc_bridge_handles")
+            except Exception:  # noqa: BLE001 - a node may be mid-restart
+                per_node[url] = None
+        handles_after_load_by_node = per_node
+        if per_node and all(value == 0 for value in per_node.values()):
+            handles_after_load = 0
+            break
+        # Not zero everywhere yet: report the sum, so a regression names a node
+        # that never drained instead of a bare null.
+        known = [value for value in per_node.values() if isinstance(value, int)]
+        handles_after_load = sum(known) if known else None
         time.sleep(1)
 
     # The last acknowledged write can land after the final read of the load, so
@@ -286,7 +298,7 @@ def main():
     final_read = None
     read_deadline = time.monotonic() + arguments.quiesce_s
     while time.monotonic() < read_deadline and final_read is None:
-        for base in (arguments.base_a, arguments.base_b):
+        for base in arguments.bases:
             try:
                 with urllib.request.urlopen(f"{base}/value", timeout=10) as response:
                     final_read = json.loads(response.read()).get("result")
@@ -319,6 +331,7 @@ def main():
         "bridge_handles": {
             "max": max(observed) if observed else None,
             "after_load": handles_after_load,
+            "per_node": handles_after_load_by_node,
             "samples": len(observed),
         },
     }

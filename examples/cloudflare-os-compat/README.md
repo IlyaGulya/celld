@@ -81,6 +81,23 @@ AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
 
 The HA test starts two production-mode nodes, creates durable state on node A, invokes a returned transient `RpcTarget` through node B, then SIGKILLs A. One request to B must wait for ownership turnover and return the same acknowledged durable state without a client-side retry loop. Use only a disposable bucket prefix: the script deploys its fixture there.
 
+### Three-node fleet
+
+Ownership at fleet size is not visible with two nodes. This gate runs three on one bucket, spreads six cells over them by writing each first through a different node, and then asserts:
+
+- every node serves every cell, including cells it does not own, so the call crosses to the owner (a two-hop path from the node that owns neither);
+- each cell is owned exactly once across the fleet's own views, and more than one node holds cells;
+- killing the node that holds the most cells leaves both survivors serving every cell, and the same identity rejoining leaves all three serving again.
+
+```sh
+CELLD_FLEET_BUCKET=s3://my-test-bucket/cloudflare-os-fleet \
+CELLD_FLEET_ENDPOINT=http://127.0.0.1:9000 \
+AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
+  bash examples/cloudflare-os-compat/fleet-test.sh ./target/debug/celld
+```
+
+A cell's key is a digest of its identity, so the gate reads the count, exclusivity and spread from the fleet's own `/state` view rather than mapping names to owners. `CELLD_FLEET_CELLS` (default 6), `CELLD_FLEET_NODES` (default 3) and `CELLD_FLEET_TIMEOUT_S` (default 60) tune it. Use a dedicated disposable prefix.
+
 ### Object-store restore
 
 To prove the fleet object store is the backup boundary rather than a node's local `CELLD_WATCH`, copy one dedicated source prefix into a different restore prefix and start from an empty local state directory:
@@ -146,7 +163,7 @@ The script deploys the same fixture as the HA gate, starts two nodes, drives con
 | bucket growth bounded | the prefix holds at most `CELLD_SOAK_BYTES_PER_WRITE_MAX` bytes per acknowledged write |
 | node memory bounded | RSS growth after the first quarter stays under `CELLD_SOAK_RSS_GROWTH_MB` (the first minutes are warmup) |
 
-Knobs: `CELLD_SOAK_DURATION_S`, `_KILL_EVERY_S`, `_RESTART_AFTER_S`, `_SETTLE_S`, `_WRITERS`, `_READERS`, `_PACE_MS`, `_S3_FAULT_PERCENT`, `_S3_FAULT_LATENCY_MS`, `_S3_FAULT_SEED`, `_BRIDGE_MAX`, `_BYTES_PER_WRITE_MAX`, `_RSS_GROWTH_MB`, `_QUIESCE_S`. Set `CELLD_SOAK_KEEP_TMP=1` to keep the report, node logs and RSS trajectory instead of deleting the run directory. Use a dedicated disposable bucket prefix.
+Knobs: `CELLD_SOAK_NODES` (default 2; the fleet is killed round-robin and every node is sampled for bridge handles, so a leak on any node fails the run), `CELLD_SOAK_DURATION_S`, `_KILL_EVERY_S`, `_RESTART_AFTER_S`, `_SETTLE_S`, `_WRITERS`, `_READERS`, `_PACE_MS`, `_S3_FAULT_PERCENT`, `_S3_FAULT_LATENCY_MS`, `_S3_FAULT_SEED`, `_BRIDGE_MAX`, `_BYTES_PER_WRITE_MAX`, `_RSS_GROWTH_MB`, `_QUIESCE_S`. Set `CELLD_SOAK_KEEP_TMP=1` to keep the report, node logs and RSS trajectory instead of deleting the run directory. Use a dedicated disposable bucket prefix.
 
 ## TDD rule
 
