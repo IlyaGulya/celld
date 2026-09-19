@@ -265,6 +265,8 @@ unexpected="$(jq -r '.unexpected_errors | length' "$REPORT")"
 rollbacks="$(jq -r '.rollbacks' "$REPORT")"
 acked="$(jq -r '.max_acknowledged' "$REPORT")"
 max_read="$(jq -r '.max_read' "$REPORT")"
+write_attempts="$(jq -r '.write_attempts' "$REPORT")"
+write_unknown="$(jq -r '.writes_without_reply' "$REPORT")"
 handles_after="$(jq -r '.bridge_handles.after_load' "$REPORT")"
 handles_max="$(jq -r '.bridge_handles.max' "$REPORT")"
 p99="$(jq -r '.latency_ms.p99' "$REPORT")"
@@ -274,8 +276,8 @@ printf '\nsoak report (%ss, %s nodes, %s calls ok, %s errors of which %s inside 
   "$(jq -r '.turnover_errors' "$REPORT")"
 printf '  nodes %s  writes %s  reads %s  kills %s  rejoins %s  p99 %sms\n' \
   "$NODES" "$writes" "$(jq -r '.reads' "$REPORT")" "$KILLS" "$REJOINS" "$p99"
-printf '  acknowledged value %s  highest read %s  bucket %s bytes in %s objects\n' \
-  "$acked" "$max_read" "$bucket_bytes" "$bucket_objects"
+printf '  acknowledged value %s  peak read %s  writes %s (%s without a reply)  bucket %s bytes in %s objects\n' \
+  "$acked" "$max_read" "$write_attempts" "$write_unknown" "$bucket_bytes" "$bucket_objects"
 printf '  rpc_bridge_handles max %s fleet-wide, after load %s\n' "$handles_max" "$handles_after"
 
 # A node's first minutes are warmup - V8 pools, bundler caches, the boot index -
@@ -301,16 +303,25 @@ rss_limit_kb=$((RSS_GROWTH_MB * 1024))
   || fail "no unexpected errors" "$(jq -c '.unexpected_errors' "$REPORT")"
 [[ "$rollbacks" == "0" ]] && pass "no rollback" "no read moved backwards" \
   || fail "no rollback" "$rollbacks reads went backwards"
-[[ "$max_read" -le "$acked" ]] && pass "no invented state" "highest read $max_read, highest acknowledged $acked" \
-  || fail "no invented state" "read $max_read was never acknowledged (highest $acked)"
-# RPO=0 under load: the last acknowledged write is the value the fleet serves
-# after every kill, every restart and every injected storage fault.
+# RPO=0 under load. An acknowledgement is a lower bound: a write whose reply was
+# lost - the node was killed while answering - is still committed, so the fleet
+# may read *above* the highest acknowledged value. What must hold is that
+# nothing the client saw acknowledged was lost, and that no read exceeds the
+# increments the client asked for.
 final_read="$(jq -r '.final_read' "$REPORT")"
-if [[ "$final_read" == "$acked" && "$acked" != "0" && "$acked" != "null" ]]; then
-  pass "acknowledged write survived" "value $acked read back after the load stopped"
+if [[ -n "$final_read" && "$final_read" != "null" && "$final_read" -ge "$acked" && "$acked" != "0" ]]; then
+  pass "acknowledged write survived" "value $acked acknowledged, $final_read durable at the end"
 else
-  fail "acknowledged write survived" "acknowledged $acked, read back $final_read"
+  fail "acknowledged write survived" "acknowledged $acked, read back ${final_read:-nothing}"
 fi
+# The end state is read after the load, so it can exceed the peak seen during
+# it; what it must never be is lower, which would be state moving backwards.
+[[ "$final_read" != "null" && "$final_read" -ge "$max_read" ]] \
+  && pass "state never went backwards" "peak read $max_read, end state $final_read" \
+  || fail "state never went backwards" "peak read $max_read, end state ${final_read:-nothing}"
+[[ "$final_read" != "null" && "$final_read" -le "$write_attempts" ]] \
+  && pass "no fabricated state" "$final_read increments for $write_attempts requested" \
+  || fail "no fabricated state" "read $final_read exceeds the $write_attempts increments requested"
 [[ "$KILLS" -ge 1 && "$REJOINS" -eq "$KILLS" ]] \
   && pass "turnover exercised" "$KILLS kills, $REJOINS rejoins" \
   || fail "turnover exercised" "$KILLS kills, $REJOINS rejoins, $REJOIN_ATTEMPTS retries"

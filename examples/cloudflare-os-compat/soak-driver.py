@@ -30,11 +30,19 @@ FAILURE = object()
 class Metrics:
     """What the soak has to prove, counted where it can be counted soundly.
 
-    Concurrent writers mean a read is only required to see what was
-    acknowledged *before it started*, so the reader samples the frontier first.
-    A value read that no writer has acknowledged yet is not invented state
-    either - it becomes one only if it is still unacknowledged when the run
-    ends, which is judged from `max_read`.
+    A client's acknowledgement is a *lower* bound on durable state, not an upper
+    one: a write whose response is lost - the node was killed while answering -
+    can still be committed, so a read above the last acknowledged value is not
+    invented state. Three facts are sound and together they cover the same
+    ground:
+
+    - a read is only required to see what was acknowledged *before it started*,
+      so the reader samples the frontier first (a concurrent writer's in-flight
+      value is not a rollback);
+    - every value the client saw acknowledged has to stay readable (`final_read`
+      is at least `max_acknowledged`);
+    - a read can never exceed the number of increments the client asked for, so
+      `final_read` above `write_attempts` would be state nobody wrote.
     """
 
     def __init__(self):
@@ -49,10 +57,24 @@ class Metrics:
         self.unexpected = []
         self.reads = 0
         self.writes = 0
+        # Every increment the client asked for, including the ones whose reply
+        # it never saw: those are the only writes that can be durable without
+        # being acknowledged.
+        self.write_attempts = 0
+        self.write_unknown = 0
 
     def frontier(self):
         with self.lock:
             return self.max_acknowledged
+
+    def record_attempt(self, write):
+        with self.lock:
+            if write:
+                self.write_attempts += 1
+
+    def record_unknown_write(self):
+        with self.lock:
+            self.write_unknown += 1
 
     def record_ok(self, latency, value=None, write=False, frontier=0):
         with self.lock:
@@ -109,6 +131,7 @@ class Window:
 
 def one_call(base, path, timeout, window, metrics, write, origin=0.0):
     frontier = metrics.frontier() if not write else 0
+    metrics.record_attempt(write)
     started = time.monotonic()
     try:
         with urllib.request.urlopen(
@@ -116,6 +139,8 @@ def one_call(base, path, timeout, window, metrics, write, origin=0.0):
         ) as response:
             payload = json.loads(response.read())
     except Exception as error:  # noqa: BLE001 - every failure is data here
+        if write:
+            metrics.record_unknown_write()
         metrics.record_error(
             window.is_open(), f"{path}: {error}", round(time.monotonic() - origin, 1)
         )
@@ -317,6 +342,8 @@ def main():
         "unexpected_errors": metrics.unexpected,
         "reads": metrics.reads,
         "writes": metrics.writes,
+        "write_attempts": metrics.write_attempts,
+        "writes_without_reply": metrics.write_unknown,
         "rollbacks": metrics.rollbacks,
         "max_acknowledged": metrics.max_acknowledged,
         "max_read": metrics.max_read,
