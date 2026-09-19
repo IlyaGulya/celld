@@ -63,8 +63,10 @@ PROXY_PID=""
 FAILURES=0
 
 cleanup() {
+  # SIGKILL, not SIGTERM: a signalled node drains before exiting, which leaves
+  # the listener held past the end of the run and breaks the next one.
   for pid in "$PID_A" "$PID_B" "$PROXY_PID"; do
-    [[ -n "$pid" ]] && kill "$pid" >/dev/null 2>&1 || true
+    [[ -n "$pid" ]] && kill -9 "$pid" >/dev/null 2>&1 || true
   done
   if [[ "${CELLD_SOAK_KEEP_TMP:-0}" == "1" ]]; then
     echo "kept run artifacts in $TMP" >&2

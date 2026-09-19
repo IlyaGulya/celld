@@ -107,6 +107,13 @@ jobs:
           CELLD_HA_ENDPOINT="$S3_ENDPOINT" \
             bash examples/cloudflare-os-compat/ha-test.sh "$PWD/target/debug/celld"
 
+      - name: Three-node ownership and turnover
+        run: |
+          set -euo pipefail
+          CELLD_FLEET_BUCKET="s3://agentos-phase0/${{ github.run_id }}/fleet" \
+          CELLD_FLEET_ENDPOINT="$S3_ENDPOINT" \
+            bash examples/cloudflare-os-compat/fleet-test.sh "$PWD/target/debug/celld"
+
       - name: Object-store-only disaster restore
         run: |
           set -euo pipefail

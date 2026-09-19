@@ -36,8 +36,12 @@ export class Host extends DurableObject {
 
 export default {
   async fetch(request, env) {
-    const host = env.HOST.getByName("phase0");
-    const path = new URL(request.url).pathname;
+    // A named cell makes ownership observable across a fleet: several cells
+    // spread over the nodes, so a gate can check who owns what and that every
+    // node can reach every cell through the owner.
+    const url = new URL(request.url);
+    const host = env.HOST.getByName(url.searchParams.get("cell") ?? "phase0");
+    const path = url.pathname;
     if (path === "/prime") {
       return Response.json({ result: await host.prime() });
     }
